@@ -1261,7 +1261,11 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
             try:
                 policy_error = await page.locator("text=violate our policies").is_visible()
                 cant_generate = await page.locator("text=I can't generate the content you requested").is_visible()
-                try_else = await page.locator("text=Try something else").is_visible()
+                try_else = False # await page.locator("text=Try something else").is_visible()
+                
+                if policy_error: log("[!] Detected 'violate our policies'")
+                if cant_generate: log("[!] Detected 'I can't generate the content you requested'")
+                
                 captcha = await page.locator("text=Verify you are human").is_visible()
                 cloudflare = await page.locator("text=Checking if the site connection is secure").is_visible()
                 high_demand = await page.locator("text=experiencing high demand").is_visible() or "from_logout=1" in page.url
