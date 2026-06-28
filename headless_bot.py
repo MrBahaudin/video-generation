@@ -67,7 +67,7 @@ DESKTOP_USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
 ]
 
-async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_id=1, log_callback=default_log, error_callback=None, output_dir=".", caption=None, wait_timeout=600, watermark_mode="Blur (Delogo)", ffmpeg_sem=None, stop_check=None, proxy=None, mobile_mode=True, naming_mode="Title in CSV"):
+async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_id=1, log_callback=default_log, error_callback=None, output_dir=".", caption=None, wait_timeout=600, watermark_mode="Blur (Delogo)", ffmpeg_sem=None, stop_check=None, proxy=None, mobile_mode=True, naming_mode="Title in CSV", on_generating_callback=None):
     def log(msg):
         log_callback(f"[Bot {instance_id}] {msg}")
         
@@ -1018,6 +1018,9 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
                 await asyncio.sleep(1)
                 await page.keyboard.press("Enter")
                 log("[+] Prompt submitted using Enter key!")
+                
+                if on_generating_callback:
+                    on_generating_callback()
                 
                 # Try to click send buttons if Enter didn't work or just to be safe
                 try:

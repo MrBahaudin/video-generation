@@ -127,7 +127,16 @@ class DolaBotWorker(QThread):
                     if self._is_stopped:
                         return
                         
-                    active += 1
+                    is_generating = False
+                    def on_generating():
+                        nonlocal active, is_generating
+                        if not is_generating:
+                            is_generating = True
+                            active += 1
+                            failed_cnt = completed - successes
+                            queued_cnt = self.total - completed - active
+                            self.stats_signal.emit(self.total, queued_cnt, active, successes, failed_cnt)
+
                     failed = completed - successes
                     queued = self.total - completed - active
                     self.stats_signal.emit(self.total, queued, active, successes, failed)
@@ -137,7 +146,8 @@ class DolaBotWorker(QThread):
                         # Uninterruptible sleep replaced with a loop to check stop flag
                         for _ in range(self.next_delay):
                             if self._is_stopped:
-                                active -= 1
+                                if is_generating:
+                                    active -= 1
                                 self.stats_signal.emit(self.total, queued, active, successes, failed)
                                 return
                             await asyncio.sleep(1)
@@ -154,7 +164,7 @@ class DolaBotWorker(QThread):
 
                     self.log(f"[Bot {instance_id}] Starting with prompt: '{prompt_text[:30]}...'")
                     try:
-                        res = await run_bot(
+                        success = await run_bot(
                             browser=browser,
                             prompt_text=prompt_text,
                             duration=self.duration,
@@ -169,20 +179,23 @@ class DolaBotWorker(QThread):
                             stop_check=lambda: self._is_stopped,
                             proxy=proxy,
                             mobile_mode=self.mobile_mode,
-                            naming_mode=self.naming_mode
+                            naming_mode=self.naming_mode,
+                            on_generating_callback=on_generating
                         )
+                        
+                        if success:
+                            successes += 1
+                        else:
+                            # Track failed prompt for retry
+                            self._failed_prompts.append(data)
                     except Exception as e:
                         self.log_error(f"[-] [Bot {instance_id}] Error in worker: {str(e)}")
-                        res = False
+                        success = False
+                        
+                    if is_generating:
+                        active -= 1
 
                     completed += 1
-                    if res:
-                        successes += 1
-                    else:
-                        # Track failed prompt for retry
-                        self._failed_prompts.append(data)
-                        
-                    active -= 1
                     failed = completed - successes
                     queued = self.total - completed - active
                     
