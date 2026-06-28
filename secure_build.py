@@ -84,7 +84,7 @@ def step1_nuitka():
         "--standalone",
         "--onefile",
         "--assume-yes-for-downloads",
-        "--windows-console-mode=disable",       # Fixed: no console window
+        "--windows-console-mode=hide",       # Fixed: hide console instead of disable so Playwright browser can show
 
         # ── Qt Plugin (fixes blank window / Qt errors) ──
         "--enable-plugin=pyqt6",
