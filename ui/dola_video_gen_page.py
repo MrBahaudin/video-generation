@@ -418,13 +418,14 @@ class DolaVideoGenPage(QWidget):
         row3 = QHBoxLayout()
         row3.setSpacing(24)
 
-        # NOTE: Hide Browser, Loop, and Mobile Emulation disabled per user request
+        # NOTE: Loop and Mobile Emulation hidden; Hide Browser visible
         self._loop_cb = QCheckBox("Auto-Loop Batch")
         self._loop_cb.setChecked(False)
         self._loop_cb.hide()
+
         self._headless_cb = QCheckBox("Hide Browser")
-        self._headless_cb.setChecked(False)
-        self._headless_cb.hide()
+        self._headless_cb.setChecked(True)
+        row3.addWidget(self._headless_cb)
         
         self._mobile_cb = QCheckBox("Mobile Emulation")
         self._mobile_cb.setChecked(False)
@@ -833,9 +834,40 @@ class DolaVideoGenPage(QWidget):
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"Could not read proxy file:\n{e}")
 
-    # ─── Logging ───────────────────────────────────────
+    # Noisy patterns to filter from terminal (internal bot details)
+    _LOG_SUPPRESS = [
+        "[V7 Route]", "[V7]", "[V7 JS",
+        "... still waiting ...",
+        "... still checking for process start",
+        "Clicked duration trigger", "Clicked ratio trigger",
+        "Selected 10s duration", "Selected 9:16",
+        "Page interactive element found",
+        "Network idle timeout",
+        "Send button fallback error",
+        "Could not set duration", "Could not set ratio",
+        "Could not click Video tab",
+        "Clicked Video mode using", "Clicked 'More' menu", "Video tab clicked via JS",
+        "Desktop UA:", "Mobile emulation:",
+        "No popups detected",
+        "Auto-dismissed popup", "Auto-dismissed dialog",
+        "Playwright route interception",
+        "Clean prompt:",
+        "Checking if generation process",
+        "Checking for confirmation popups",
+        "Selecting 'Video' tab", "Selecting 10s duration", "Selecting aspect ratio",
+        "Clicked Send button as fallback",
+        "Re-pressing Enter",
+    ]
 
     def _log(self, message, level="info"):
+        # Always check error tally even for filtered messages
+        self._check_error_tally(message)
+
+        # Suppress noisy internal messages from terminal display
+        for pattern in self._LOG_SUPPRESS:
+            if pattern in message:
+                return
+
         colors = {"info": "#94a3b8", "success": "#10b981", "error": "#ef4444", "warn": "#f59e0b"}
         color = colors.get(level, "#94a3b8")
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -850,7 +882,6 @@ class DolaVideoGenPage(QWidget):
         cursor.insertText(f"{message}\n")
         self._console.setTextCursor(cursor)
         self._console.ensureCursorVisible()
-        self._check_error_tally(message)
 
         # Auto-trim console to prevent memory leak (keep last 2000 lines)
         if self._console.document().blockCount() > 2000:

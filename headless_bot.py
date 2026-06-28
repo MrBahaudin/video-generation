@@ -497,6 +497,7 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
         clean_prompt = re.sub(r'(?i)^generate\s+image\s*:\s*', '', prompt_text).strip()
         clean_prompt = re.sub(r'(?i)generate\s+image', 'Generate video', clean_prompt)
         clean_prompt = re.sub(r'(?i)^Generated\s+video\s*:\s*', '', clean_prompt).strip()
+        clean_prompt = re.sub(r'(?i)^\d+\s+second\s+video\s*:\s*', '', clean_prompt).strip()
         clean_prompt = re.sub(r'(?i)^Generate\s+a\s+\d+\s+second\s+video\s*:\s*', '', clean_prompt).strip()
         clean_prompt = re.sub(r'(?i)^Generate\s+a\s+video\s*:\s*', '', clean_prompt).strip()
         clean_prompt = re.sub(r'(?i)^Generate\s+video\s*:\s*', '', clean_prompt).strip()
@@ -510,7 +511,8 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
             """Remove ALL second-based timestamps and convert to narrative transitions.
             Handles ALL known formats:
               - 0-3s:, 3-7s:, 7-11s:  (with 's' suffix)
-              - [0.0–2.], [2.5–5.], [10.0–12.], [12.5–15.]  (bracket+decimal)
+              - [0.0–2.], [2.5–5.], [10.0–12.], [12.5–15.]  (bracket+decimal range)
+              - [0.0–], [2.5–], [10.0–]  (bracket+decimal, single number + dash)
               - [0-3], [3-7], [7-11]  (bracket+integer)
               - (0:00-0:03), (0:03-0:07)  (timecode in parens)
               - 00:00-00:03, 0:03-0:07  (bare timecodes)
@@ -540,6 +542,9 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
             
             # Format 1: [0.0–2.] or [2.5–5.] or [10.0–12.] or [12.5-15.] (bracket + decimal)
             result = re.sub(r'\[\d+\.?\d*\s*[-–]\s*\d+\.?\d*\.?\]', _get_transition, result)
+            
+            # Format 1.5: [0.0–] or [2.5–] or [10.0–] (bracket + single number + dash, NO end number)
+            result = re.sub(r'\[\d+\.?\d*\s*[-–]\s*\]', _get_transition, result)
             
             # Format 2: [0-3] or [3-7] or [7-11] (bracket + integer, no decimal)
             result = re.sub(r'\[\d+\s*[-–]\s*\d+\]', _get_transition, result)
@@ -761,41 +766,39 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
         # Wait for the page UI to fully render before interacting
         # Extra patience for slow connections
         try:
-            await page.wait_for_load_state("networkidle", timeout=45000)
+            await page.wait_for_load_state("networkidle", timeout=30000)
         except:
-            log("[i] Network idle timeout — page may still be loading, waiting more...")
-            await asyncio.sleep(5)
-        await asyncio.sleep(3)
+            log("[i] Network idle timeout — continuing anyway...")
+            await asyncio.sleep(2)
+        await asyncio.sleep(1)
         
-        # Extra wait: make sure the main content area is visible
+        # Wait for the main content area to be visible
         for wait_sel in ["div[role='textbox']", "textarea", "button", "input"]:
             try:
-                await page.wait_for_selector(wait_sel, state="visible", timeout=15000)
-                log(f"[i] Page interactive element found: {wait_sel}")
+                await page.wait_for_selector(wait_sel, state="visible", timeout=10000)
                 break
             except:
                 continue
         
-        await asyncio.sleep(2)  # Extra buffer for slow rendering
+        await asyncio.sleep(0.5)
         
         log("Selecting 'Video' tab or mode...")
         video_clicked = False
         
         # Dismiss any popups/login modals first
         await dismiss_popups(page)
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.3)
         
-        # Wait for page to be fully loaded — retry with longer timeout for slow internet
-        for attempt in range(3):
+        # Wait for page to be fully loaded
+        for attempt in range(2):
             try:
-                await page.wait_for_selector("button, div[role='tab'], span", state="visible", timeout=15000)
+                await page.wait_for_selector("button, div[role='tab'], span", state="visible", timeout=8000)
                 break
             except:
-                if attempt < 2:
-                    log(f"[i] Page elements not ready, waiting more... (attempt {attempt+1}/3)")
-                    await asyncio.sleep(3)
+                if attempt < 1:
+                    await asyncio.sleep(1)
                 else:
-                    log("[-] Page still not fully loaded after retries, proceeding anyway...")
+                    log("[-] Page still not fully loaded, proceeding anyway...")
         
         # Comprehensive selectors for Video tab (desktop + mobile views)
         video_selectors = [
@@ -813,9 +816,9 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
         for sel in video_selectors:
             try:
                 el = page.locator(sel).first
-                if await el.is_visible(timeout=2000):
-                    await el.scroll_into_view_if_needed(timeout=2000)
-                    await asyncio.sleep(0.3)
+                if await el.is_visible(timeout=1000):
+                    await el.scroll_into_view_if_needed(timeout=1000)
+                    await asyncio.sleep(0.2)
                     await el.click(force=True, timeout=3000)
                     video_clicked = True
                     log(f"[+] Clicked Video mode using: {sel}")
@@ -874,7 +877,7 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
         if not video_clicked:
             log("[-] WARNING: Could not click Video tab! Will try to proceed anyway...")
         
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.5)
 
         # ── Explicitly select 10s duration from the dropdown ──
         # The UI default may be 5s. We must select 10s so the hook can change it to 15s.
@@ -894,10 +897,10 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
         for sel in duration_trigger_selectors:
             try:
                 el = page.locator(sel).first
-                if await el.is_visible(timeout=2000):
-                    await el.click(force=True, timeout=2000)
+                if await el.is_visible(timeout=1000):
+                    await el.click(force=True, timeout=1000)
                     log(f"[+] Clicked duration trigger: {sel}")
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)
                     
                     # Now try to select "10s" from the dropdown/popup
                     ten_s_selectors = [
@@ -926,7 +929,7 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
         if not duration_set:
             log("[-] WARNING: Could not set duration to 10s via UI. Hook will still try to fix it in the API payload.")
         
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.3)
 
         # ── Explicitly select aspect ratio from UI ──
         log(f"Selecting aspect ratio {ratio}...")
@@ -946,10 +949,10 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
         for sel in ratio_trigger_selectors:
             try:
                 el = page.locator(sel).first
-                if await el.is_visible(timeout=2000):
-                    await el.click(force=True, timeout=2000)
+                if await el.is_visible(timeout=1000):
+                    await el.click(force=True, timeout=1000)
                     log(f"[+] Clicked ratio trigger: {sel}")
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)
                     
                     # Now try to select target ratio from dropdown
                     target_ratio_selectors = [
@@ -978,7 +981,7 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
         if not ratio_set:
             log(f"[-] WARNING: Could not set ratio to {ratio} via UI. Hook will force it in API payload.")
         
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.3)
 
         log("Entering prompt...")
         try:
@@ -1013,27 +1016,66 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
                 except Exception:
                     pass
                 
-                # Use insert_text which is extremely reliable for React/contenteditable
+                # Use insert_text which is reliable for React/contenteditable
                 await page.keyboard.insert_text(prompt_with_duration)
-                await asyncio.sleep(1)
+                
+                # Dynamic wait: longer prompts need more settle time for React/DOM
+                settle_time = max(1, min(3, len(prompt_with_duration) / 300))
+                await asyncio.sleep(settle_time)
+                
+                # Re-focus the textbox before pressing Enter (fixes stuck Enter issue)
+                try:
+                    await target_tb.click(force=True)
+                    await asyncio.sleep(0.3)
+                except:
+                    pass
+                
+                # Press Enter to submit
                 await page.keyboard.press("Enter")
-                log("[+] Prompt submitted using Enter key!")
+                log("[+] Prompt submitted!")
+                
+                # Verify submission: if textbox still has content, retry
+                await asyncio.sleep(1)
+                submit_ok = False
+                try:
+                    tb_text = await target_tb.text_content()
+                    if not tb_text or len(tb_text.strip()) < 10:
+                        submit_ok = True
+                except:
+                    submit_ok = True  # Can't check = assume it worked
+                
+                if not submit_ok:
+                    log("[i] Enter may not have fired. Retrying...")
+                    # Retry 1: Re-click textbox + Enter
+                    try:
+                        await target_tb.click(force=True)
+                        await asyncio.sleep(0.5)
+                        await page.keyboard.press("Enter")
+                        await asyncio.sleep(1)
+                    except:
+                        pass
+                    
+                    # Retry 2: Click the Send/Submit button directly
+                    send_selectors = [
+                        "button[aria-label='Send message']",
+                        "button[aria-label='Send']",
+                        "button:has-text('Send')",
+                        "button[type='submit']",
+                        "[class*='send'] button",
+                        "[class*='Send'] button",
+                    ]
+                    for sel in send_selectors:
+                        try:
+                            btn = page.locator(sel).first
+                            if await btn.is_visible(timeout=1000):
+                                await btn.click(force=True, timeout=2000)
+                                log("[+] Submitted via Send button!")
+                                break
+                        except:
+                            pass
                 
                 if on_generating_callback:
                     on_generating_callback()
-                
-                # Try to click send buttons if Enter didn't work or just to be safe
-                try:
-                    send_buttons = await page.locator("button[aria-label='Send message'], button[aria-label='Send'], button:has-text('Send'), svg[class*='send']").all()
-                    for btn in send_buttons:
-                        try:
-                            await btn.click(force=True, timeout=1000)
-                            log("[+] Clicked Send button as fallback!")
-                            break
-                        except:
-                            pass
-                except Exception as e:
-                    log(f"[-] Send button fallback error (ignored): {e}")
             else:
                 log("[-] Textbox not found!")
                 try:
@@ -1522,12 +1564,14 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
             
             if naming_mode == "Title On Video":
                 import re
+                rand_prefix = random.randint(1, 9999)
                 if caption:
                     safe_title = re.sub(r'[\\/*?:"<>|]', "", caption).strip()
-                    filename_base = f"{instance_id} - {safe_title}" if safe_title else f"{instance_id} - video"
+                    safe_title = safe_title[:80]  # Limit length to avoid path-too-long errors
+                    filename_base = f"{rand_prefix} - {safe_title}" if safe_title else f"{rand_prefix} - video"
                 else:
                     safe_title = re.sub(r'[\\/*?:"<>|]', "", prompt_text[:50]).strip()
-                    filename_base = f"{instance_id} - {safe_title}" if safe_title else f"{instance_id} - video"
+                    filename_base = f"{rand_prefix} - {safe_title}" if safe_title else f"{rand_prefix} - video"
             else: # Title in CSV
                 filename_base = f"{uuid.uuid4().hex[:8]}"
                 
