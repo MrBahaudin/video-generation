@@ -1,0 +1,53 @@
+# ═══════════════════════════════════════════════
+#  Zakariya Automator — .gitignore
+#  Source code is NEVER pushed to GitHub.
+#  Only README, releases, and workflow files.
+# ═══════════════════════════════════════════════
+
+# ── All Python source files (NEVER push these) ──
+*.py
+*.pyw
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.egg-info/
+*.egg
+dist/
+build/
+secure_build/
+
+# ── Virtual environment ──
+.venv/
+venv/
+env/
+
+# ── Sensitive config / credentials ──
+config.json
+settings.json
+*.json
+.device_id
+*.key
+*.pem
+*.env
+
+# ── Build artifacts ──
+*.spec
+*.log
+*.tmp
+
+# ── IDE / OS files ──
+.idea/
+.vscode/
+*.suo
+*.user
+Thumbs.db
+.DS_Store
+
+# ── Keep these (explicitly allow) ──
+!README.md
+!LICENSE
+!VERSION
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
