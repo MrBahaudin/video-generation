@@ -41,6 +41,19 @@ RELEASES_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/relea
 
 # App version
 def _get_current_version():
+    # Priority 1: Check VERSION file next to the exe (updated by auto-updater)
+    if getattr(sys, 'frozen', False):
+        try:
+            ext_version = os.path.join(os.path.dirname(sys.executable), "VERSION")
+            if os.path.exists(ext_version):
+                with open(ext_version, "r") as f:
+                    v = f.read().strip()
+                if v:
+                    return v
+        except Exception:
+            pass
+    
+    # Priority 2: Check bundled VERSION inside _MEIPASS (or dev source)
     try:
         base = sys._MEIPASS if hasattr(sys, '_MEIPASS') else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         version_file = os.path.join(base, "VERSION")
@@ -88,6 +101,11 @@ class AutoUpdater:
         try:
             self._log(f"Checking for updates... (current: {self.current_version})")
             resp = requests.get(RELEASES_URL, headers=self._get_headers(), timeout=15)
+            
+            # If token is revoked/invalid, retry WITHOUT token (repo may be public)
+            if resp.status_code == 401:
+                self._log("Token invalid/revoked — retrying without auth...")
+                resp = requests.get(RELEASES_URL, headers={"Accept": "application/vnd.github.v3+json"}, timeout=15)
             
             if resp.status_code == 404:
                 self._log("No releases found.")
@@ -163,15 +181,14 @@ class AutoUpdater:
             file_name = info["file_name"]
             file_size = info.get("file_size", 0)
             
-            # Download to temp location
-            if getattr(sys, 'frozen', False):
-                download_dir = os.path.dirname(sys.executable)
-            else:
-                download_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            # Download to TEMP directory (avoids Program Files permission issues)
+            import tempfile
+            download_dir = tempfile.gettempdir()
             
             download_path = os.path.join(download_dir, f"_update_{file_name}")
             
             self._log(f"Downloading: {url}")
+            self._log(f"Download location: {download_path}")
             if progress_callback:
                 progress_callback(0.0, f"Downloading v{info['version']}...")
             
@@ -192,16 +209,21 @@ class AutoUpdater:
             if progress_callback:
                 progress_callback(1.0, "Download complete!")
             
-            # ── Update local VERSION file to prevent update loop ──
-            try:
-                version_file = os.path.join(download_dir, "VERSION")
-                with open(version_file, "w") as f:
-                    f.write(info["version"])
-                self._log(f"Updated VERSION file to {info['version']}")
-            except Exception as e:
-                self._log(f"Could not update VERSION file: {e}")
+            # Verify downloaded file exists and has reasonable size
+            if not os.path.exists(download_path):
+                self._log("Download failed: file not found after download")
+                return None
             
-            self._log(f"Downloaded to: {download_path}")
+            actual_size = os.path.getsize(download_path)
+            if actual_size < 1_000_000:  # Less than 1MB = probably corrupted
+                self._log(f"Download seems corrupt: only {actual_size} bytes")
+                os.remove(download_path)
+                return None
+            
+            # NOTE: VERSION file is NOT updated here — only after successful install
+            # This ensures failed installs don't prevent retry on next launch
+            
+            self._log(f"Downloaded to: {download_path} ({actual_size / 1024 / 1024:.1f} MB)")
             return download_path
             
         except Exception as e:
@@ -210,12 +232,21 @@ class AutoUpdater:
                 progress_callback(0.0, f"Download failed: {e}")
             return None
     
-    def install_and_restart(self, download_path):
+    def install_and_restart(self, download_path, new_version=""):
         """
         Run the installer or replace the exe if it's portable.
+        
+        Args:
+            download_path: Path to the downloaded installer/exe
+            new_version: Version string for VERSION file update
         """
         if not sys.executable.endswith(".exe"):
             self._log("Not running as exe — skipping install. (Dev mode)")
+            return
+        
+        # Verify the file actually exists before proceeding
+        if not os.path.exists(download_path):
+            self._log(f"Install failed: file not found at {download_path}")
             return
             
         try:
@@ -223,11 +254,21 @@ class AutoUpdater:
             
             # If the downloaded file is a Setup installer (Inno Setup)
             if "Setup" in os.path.basename(download_path):
-                # Run the installer silently
+                # Run the installer silently with proper flags
+                import time as _time
                 subprocess.Popen(
-                    [download_path, "/SILENT", "/SP-"],
+                    [
+                        download_path,
+                        "/SILENT",
+                        "/SP-",
+                        "/CLOSEAPPLICATIONS",
+                        "/FORCECLOSEAPPLICATIONS",
+                        "/MERGETASKS=desktopicon",
+                    ],
                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                 )
+                # Give the installer process time to initialize before we exit
+                _time.sleep(2)
                 sys.exit(0)
             
             # Legacy fallback for portable EXE replacement
@@ -239,14 +280,13 @@ class AutoUpdater:
             
             # Write updated VERSION file path
             version_path = os.path.join(current_dir, "VERSION")
-            # Extract version from downloaded filename or info
-            new_version = ""
-            fname = os.path.basename(download_path)
-            # Try to extract version like "v1.1.4" from filename
-            import re
-            ver_match = re.search(r'v?(\d+\.\d+\.\d+)', fname)
-            if ver_match:
-                new_version = ver_match.group(1)
+            # Extract version from downloaded filename if not provided
+            if not new_version:
+                import re
+                fname = os.path.basename(download_path)
+                ver_match = re.search(r'v?(\d+\.\d+\.\d+)', fname)
+                if ver_match:
+                    new_version = ver_match.group(1)
             
             bat_content = f"""@echo off
 echo Updating Zakariya Automator...
@@ -255,7 +295,7 @@ if exist "{backup_path}" del "{backup_path}"
 ren "{current_exe}" "{os.path.basename(backup_path)}"
 move "{download_path}" "{current_exe}"
 """
-            # Add VERSION update to bat script
+            # Update VERSION file ONLY in the bat script (after successful file replace)
             if new_version:
                 bat_content += f'echo {new_version}> "{version_path}"\n'
             

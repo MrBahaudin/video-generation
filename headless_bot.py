@@ -16,22 +16,76 @@ except Exception:
 INTERNET_CONNECTED = True
 
 async def internet_monitor():
+    """Periodically check internet connectivity by attempting a socket connection."""
     global INTERNET_CONNECTED
+    import socket
     while True:
-        INTERNET_CONNECTED = True
+        try:
+            # Try connecting to Google DNS — fast and reliable
+            sock = socket.create_connection(("8.8.8.8", 53), timeout=5)
+            sock.close()
+            INTERNET_CONNECTED = True
+        except (socket.timeout, OSError):
+            INTERNET_CONNECTED = False
         await asyncio.sleep(30)
 
 async def dismiss_popups(page):
+    """Dismiss any login/cookie/upgrade modal. Tries JS first for speed, then CSS selectors."""
     try:
-        # Try to close login modals or other overlays
-        close_buttons = await page.locator("button[aria-label='Close'], button[aria-label='close'], .semi-modal-close").all()
-        for btn in close_buttons:
-            if await btn.is_visible():
-                await btn.click()
-                await asyncio.sleep(0.5)
+        # JS-first: instantly find & click any visible modal close button
+        clicked = await page.evaluate("""() => {
+            const allBtns = Array.from(document.querySelectorAll('button, [role="button"]'));
+            for (const btn of allBtns) {
+                const rect = btn.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) continue;
+                const text = btn.textContent.trim();
+                const cls = (btn.className || '').toLowerCase();
+                const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+                const isCloseBtn = (
+                    text === '×' || text === '✕' || text === '✗' || text === 'X' ||
+                    cls.includes('close') || aria.includes('close') ||
+                    aria === 'dismiss' || aria === 'cancel'
+                );
+                if (isCloseBtn) { btn.click(); return true; }
+            }
+            return false;
+        }""")
+        if clicked:
+            await asyncio.sleep(0.3)
+            return
+
+        # CSS fallback selectors
+        for sel in [
+            "button[aria-label='Close']", "button[aria-label='close']",
+            ".semi-modal-close", "button:has-text('×')", "button:has-text('✕')",
+            "[class*='modal'] [class*='close' i]", "[class*='dialog'] [class*='close' i]",
+        ]:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=200):
+                    await btn.click(force=True)
+                    await asyncio.sleep(0.3)
+                    break
+            except:
+                pass
+
         await page.keyboard.press("Escape")
+        await asyncio.sleep(0.2)
     except Exception:
         pass
+
+
+async def dismiss_popups_aggressive(page, max_attempts=6):
+    """Keep dismissing until 'Log In' modal is gone (max 3s total)."""
+    for _ in range(max_attempts):
+        try:
+            modal_visible = await page.locator("text=Log In to Unlock").is_visible(timeout=300)
+            if not modal_visible:
+                break
+        except:
+            break
+        await dismiss_popups(page)
+        await asyncio.sleep(0.5)
 
 def default_log(msg):
     print(msg)
@@ -67,7 +121,7 @@ DESKTOP_USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
 ]
 
-async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_id=1, log_callback=default_log, error_callback=None, output_dir=".", caption=None, wait_timeout=600, watermark_mode="Blur (Delogo)", ffmpeg_sem=None, stop_check=None, proxy=None, mobile_mode=True, naming_mode="Title in CSV", on_generating_callback=None):
+async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_id=1, log_callback=default_log, error_callback=None, output_dir=".", caption=None, wait_timeout=600, watermark_mode="Blur (Delogo)", ffmpeg_sem=None, stop_check=None, proxy=None, mobile_mode=True, naming_mode="Title in CSV", on_generating_callback=None, process_start_timeout=60):
     def log(msg):
         log_callback(f"[Bot {instance_id}] {msg}")
         
@@ -82,7 +136,7 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
         # Pick a random mobile device or desktop UA for fingerprint diversity
         if mobile_mode:
             device = random.choice(MOBILE_DEVICES)
-            log(f"[+] Mobile emulation: {device['name']}")
+            pass  # mobile emulation active
             context_opts = {
                 "user_agent": device["user_agent"],
                 "viewport": device["viewport"],
@@ -123,7 +177,7 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
         # PRIMARY: page.route() intercepts ALL requests at network level (undetectable by site JS)
         # BACKUP: Lightweight JS init_script hooks as fallback
         
-        target_duration = 15  # The actual duration we want
+        target_duration = 15  # Force 15s in API — UI shows 10s to avoid dialog
         target_duration_str = "15"
         target_ratio_str = ratio  # e.g. "9:16"
         
@@ -142,13 +196,27 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
             'size_ratio', 'frame_ratio', 'display_ratio',
         ]
         
-        # Duration values to replace (anything that's NOT 15)
+        # Duration values to replace with target (5s default → 15s, 10s UI selection → 15s)
         DURATION_REPLACE_VALUES_INT = [5, 10, 3, 4, 6, 7, 8]
         DURATION_REPLACE_VALUES_STR = ['5', '10', '3', '4', '5s', '10s', '3s', '4s', '6s', '7s', '8s', 'short', 'medium']
         
         import json as _json
         import re as _re
         from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+        def _flatten_keys(d, depth=0):
+            """Recursively collect all keys from nested dict."""
+            if not isinstance(d, dict) or depth > 10:
+                return []
+            keys = list(d.keys())
+            for v in d.values():
+                if isinstance(v, dict):
+                    keys.extend(_flatten_keys(v, depth + 1))
+                elif isinstance(v, list):
+                    for item in v:
+                        if isinstance(item, dict):
+                            keys.extend(_flatten_keys(item, depth + 1))
+            return keys
         
         def _patch_dict(d, depth=0):
             """Recursively patch duration and ratio fields in a dict."""
@@ -336,36 +404,30 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
                         # ── SMART FILTER: Skip chatbot message requests ──
                         # Chatbot message requests contain the user's prompt text.
                         # If we change duration in these, the chatbot AI sees 15 and warns.
-                        # Detection: chatbot messages go to /chat/ or /message/ endpoints
-                        # and contain long text content (the prompt).
                         
                         url_lower = url.lower()
                         is_chat_endpoint = any(ep in url_lower for ep in [
                             '/chat/', '/message/', '/conversation/', '/send',
                             '/ask/', '/query/', '/prompt/',
                         ])
-                        
-                        # Also detect by body content: if body contains very long text
-                        # (the user's prompt), it's a chatbot message, not a generation config
-                        is_chatbot_message = False
+
+                        # Only skip if it's a chat endpoint AND the body has NO generation-specific fields
+                        # NOTE: DO NOT skip based on body content length — video generation requests
+                        # also contain the long prompt text. We must still patch ratio/duration in those.
+                        has_generation_fields = False
                         try:
                             data = _json.loads(body)
                             if isinstance(data, dict):
-                                # Check if any string value is very long (prompt text)
-                                for k, v in data.items():
-                                    if isinstance(v, str) and len(v) > 100:
-                                        is_chatbot_message = True
-                                        break
-                                # Also check for chat-specific fields
-                                chat_fields = ['message', 'content', 'text', 'prompt', 'query', 'user_message', 'input']
-                                if any(cf in str(data.keys()).lower() for cf in chat_fields):
-                                    is_chatbot_message = True
+                                all_keys = ' '.join(str(k).lower() for k in _flatten_keys(data))
+                                gen_indicators = ['skill', 'resolution', 'fps', 'frame', 'video_condition',
+                                                  'ratio', 'aspect', 'duration', 'width', 'height', 'seed']
+                                if any(gi in all_keys for gi in gen_indicators):
+                                    has_generation_fields = True
                         except:
                             pass
-                        
-                        if is_chat_endpoint or is_chatbot_message:
-                            # Let chatbot messages pass through WITHOUT modification
-                            # This prevents the "videos longer than 10 seconds" warning
+
+                        if is_chat_endpoint and not has_generation_fields:
+                            # Pure chatbot text message — let it through without modification
                             await route.continue_()
                             return
                         
@@ -491,8 +553,6 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
         # ── V7 PROMPT FIX: Strip ALL duration/timestamp clues so Dola AI NEVER warns ──
         # The goal: Dola should see ZERO references to seconds, timestamps, or duration.
         # Timestamps like "0-3s:", "7-11s:" are converted to narrative transitions.
-        # Duration mentions like "10 second video" are removed entirely.
-        
         # Step 1: Remove known prefixes FIRST (before timestamp stripping eats the numbers)
         clean_prompt = re.sub(r'(?i)^generate\s+image\s*:\s*', '', prompt_text).strip()
         clean_prompt = re.sub(r'(?i)generate\s+image', 'Generate video', clean_prompt)
@@ -500,11 +560,50 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
         clean_prompt = re.sub(r'(?i)^\d+\s+second\s+video\s*:\s*', '', clean_prompt).strip()
         clean_prompt = re.sub(r'(?i)^Generate\s+a\s+\d+\s+second\s+video\s*:\s*', '', clean_prompt).strip()
         clean_prompt = re.sub(r'(?i)^Generate\s+a\s+video\s*:\s*', '', clean_prompt).strip()
+
+        # ── REMOVE ALL RATIO PATTERNS FROM ANYWHERE IN PROMPT ──
+        # Covers: 16:9, 9:16, 4:3, 3:4, 21:9, 2:1, 1:1, etc. (anywhere in text)
+        clean_prompt = re.sub(r'\b\d{1,2}:\d{1,2}\b', '', clean_prompt)
+        
+        # Also remove "Negative prompt:" section — Dola doesn't support it, it confuses generation
+        clean_prompt = re.sub(r'(?i)\bNegative\s+prompt\s*:.*$', '', clean_prompt, flags=re.DOTALL).strip()
+
+        # Clean up leftover double commas and extra spaces from removals
+        clean_prompt = re.sub(r',\s*,+', ',', clean_prompt)
+        clean_prompt = re.sub(r',\s*\.', '.', clean_prompt)
+        clean_prompt = re.sub(r'\s{2,}', ' ', clean_prompt).strip()
+        clean_prompt = clean_prompt.strip(', ')
+
         clean_prompt = re.sub(r'(?i)^Generate\s+video\s*:\s*', '', clean_prompt).strip()
         
-        # Step 2: Remove explicit duration mentions: "10 second video", "15-second clip"
-        clean_prompt = re.sub(r'(?i)\b\d+[\s-]?second[s]?\s+(long\s+)?(video|clip|footage)\b', r'\2', clean_prompt)
-        clean_prompt = re.sub(r'(?i)\b\d+[\s-]?second[s]?\s+(long\s+)?', '', clean_prompt)
+        # Step 2: Cap all duration mentions > 10 down to "10 second" / "10s"
+        # e.g. "15 second video" → "10 second video", "20s clip" → "10s clip"
+        # This prevents Dola's ">10 second" dialog. API hook still forces 15s in payload.
+        def _cap_seconds(m):
+            num_str = m.group(1)
+            suffix = m.group(2)
+            try:
+                if int(num_str) > 10:
+                    return f"10{suffix}"
+            except:
+                pass
+            return m.group(0)
+        
+        # Pattern: "15 second", "20-second", "15s" etc.
+        clean_prompt = re.sub(
+            r'\b(\d+)([\s-]?seconds?)\b',
+            _cap_seconds,
+            clean_prompt,
+            flags=re.IGNORECASE
+        )
+        # Pattern: "15s" standalone (e.g. "0-15s:", "15s clip")
+        clean_prompt = re.sub(
+            r'\b(\d+)(s)\b(?!\w)',
+            _cap_seconds,
+            clean_prompt,
+            flags=re.IGNORECASE
+        )
+
         
         # Step 3: Convert ALL timestamp formats to narrative transitions
         def _strip_all_timestamps(prompt):
@@ -555,8 +654,27 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
             # Format 4: (0:00-0:03) or (0:03-0:07) (timecode in parentheses)
             result = re.sub(r'\(\s*\d+:\d+\s*[-–]\s*\d+:\d+\s*\)', _get_transition, result)
             
-            # Format 5: 0:00-0:03 or 00:00-00:03 (bare timecodes with colon separator)
+            # Format 5: 0:00-0:03 or 00:00-00:03 (bare timecodes with dash separator)
             result = re.sub(r'\b\d+:\d+\s*[-–]\s*\d+:\d+\b', _get_transition, result)
+            
+            # Format 5b: "From 0:02 to 0:04" or "from 0:06 to 0:08" (timecodes with "to" keyword)
+            # THIS IS THE COMMON FORMAT IN USER PROMPTS — was previously missed!
+            result = re.sub(
+                r'(?i)\bfrom\s+\d+:\d+\s+to\s+\d+:\d+\b',
+                _get_transition, result
+            )
+            # Also handle "0:02 to 0:04" without "From" prefix
+            result = re.sub(
+                r'\b\d+:\d+\s+to\s+\d+:\d+\b',
+                _get_transition, result
+            )
+            
+            # Format 5c: "At 0:00" or "at 0:07" standalone timecode references
+            # e.g. "At 0:00 the baby yawns" → "Opening scene: the baby yawns"
+            result = re.sub(
+                r'(?i)\bat\s+\d+:\d+\b',
+                _get_transition, result
+            )
             
             # Format 6: 0-3: or 3-7: or 7-11: (plain number range with colon, no 's')
             result = re.sub(r'\b\d+\s*[-–]\s*\d+\s*:\s*', _get_transition, result)
@@ -584,12 +702,23 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
             # Format 13: "X seconds" without abbreviation
             result = re.sub(r'\b\d+\s+seconds?\b', '', result, flags=re.IGNORECASE)
             
+            # Format 14: ANY remaining bare M:SS timestamps (not aspect ratios)
+            # Last resort — catches anything that slipped through above formats
+            aspect_ratios_pat = {'9:16', '16:9', '4:3', '3:4', '1:1', '21:9', '9:21', '16:10', '10:16'}
+            def _remove_bare_timestamp(m):
+                if m.group(0) in aspect_ratios_pat:
+                    return m.group(0)  # Keep aspect ratios
+                return ''
+            result = re.sub(r'\b\d{1,2}:\d{2}\b', _remove_bare_timestamp, result)
+            
             return result
         
         clean_prompt = _strip_all_timestamps(clean_prompt)
+
         
-        # Step 4: Remove any leftover "15s", "10s", "5s" 
-        clean_prompt = re.sub(r'(?i)\b(15|10|5)\s*s\b', '', clean_prompt)
+        # Step 4: (Step 2 already capped all >10s durations to 10 — nothing more needed here)
+        # Step 3 strips timestamp RANGES like "0-3s:" but preserves standalone "10 second" mentions.
+
         
         # Step 5: Strip unsupported feature instructions that trigger Dola warnings
         # Dola does NOT support voice-over, narration, subtitles, or captions.
@@ -746,16 +875,82 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
             result = _fix_second_refs(result)
             return result
         
+        # ── Step 8: MULTI-SHOT SCENE COMPRESSION ──
+        # Prompts with many sequential shot types (close-up, two-shot, reaction shot, etc.)
+        # cause Dola to detect a multi-scene timeline longer than 10s.
+        # Fix: Strip the cinematic shot-type prefixes so the prompt reads as ONE scene.
+        
+        # Count how many distinct shot labels exist
+        shot_label_patterns = [
+            r'(?i)\b(close[-\s]?up\s+on\b)',
+            r'(?i)\b(extreme\s+close[-\s]?up\s+on\b)',
+            r'(?i)\b(two[-\s]?shot\b)',
+            r'(?i)\b(reaction\s+shot\s+of\b)',
+            r'(?i)\b(over[-\s]?the[-\s]?shoulder\s+(toward|of|shot)\b)',
+            r'(?i)\b(low\s+angle\s+from\b)',
+            r'(?i)\b(high\s+angle\s+(from|of|on)\b)',
+            r'(?i)\b(wide\s+shot\s+of\b)',
+            r'(?i)\b(medium\s+shot\s+of\b)',
+            r'(?i)\b(aerial\s+shot\b)',
+            r'(?i)\b(tracking\s+shot\b)',
+            r'(?i)\b(establishing\s+shot\b)',
+            r'(?i)\b(point[-\s]?of[-\s]?view\s+shot\b)',
+            r'(?i)\b(insert\s+shot\b)',
+            r'(?i)\b(cut\s+to\b)',
+            r'(?i)\b(final\s+close[-\s]?up\s+on\b)',
+        ]
+        
+        shot_count = sum(
+            1 for pat in shot_label_patterns
+            if re.search(pat, clean_prompt)
+        )
+        
+        if shot_count >= 3:
+            log(f"[V7] Detected {shot_count} sequential shot labels — compressing to single-scene description...")
+            # Strip shot-type prefixes but keep the description after them
+            strip_patterns = [
+                (r'(?i)\bfinal\s+close[-\s]?up\s+on\b', ''),
+                (r'(?i)\bextreme\s+close[-\s]?up\s+on\b', ''),
+                (r'(?i)\bclose[-\s]?up\s+on\b', ''),
+                (r'(?i)\breaction\s+shot\s+of\b', ''),
+                (r'(?i)\btwo[-\s]?shot\s+', ''),
+                (r'(?i)\bover[-\s]?the[-\s]?shoulder\s+(toward|of|shot)\b', ''),
+                (r'(?i)\blow\s+angle\s+from\b', ''),
+                (r'(?i)\bhigh\s+angle\s+(from|of|on)\b', ''),
+                (r'(?i)\bwide\s+shot\s+of\b', ''),
+                (r'(?i)\bmedium\s+shot\s+of\b', ''),
+                (r'(?i)\baerial\s+shot\b,?\s*', ''),
+                (r'(?i)\btracking\s+shot\b,?\s*', ''),
+                (r'(?i)\bestablishing\s+shot\b,?\s*', ''),
+                (r'(?i)\bpoint[-\s]?of[-\s]?view\s+shot\b,?\s*', ''),
+                (r'(?i)\binsert\s+shot\b,?\s*', ''),
+                (r'(?i)\bcut\s+to\b,?\s*', ''),
+                (r'(?i)\bangle\s+(from|toward|on)\b', ''),
+            ]
+            for pattern, replacement in strip_patterns:
+                clean_prompt = re.sub(pattern, replacement, clean_prompt)
+            
+            # Clean up artifacts left from stripping
+            clean_prompt = re.sub(r'\s{2,}', ' ', clean_prompt)
+            clean_prompt = re.sub(r',\s*,', ',', clean_prompt)
+            clean_prompt = re.sub(r'\.\s*\.', '.', clean_prompt)
+            clean_prompt = re.sub(r',\s*\.', '.', clean_prompt)
+            clean_prompt = re.sub(r'^[\s,.:]+', '', clean_prompt).strip()
+            log(f"[V7] Shot labels stripped. New length: {len(clean_prompt)} chars.")
+        
         clean_prompt = _rescale_timestamps(clean_prompt)
         
-        has_video_word = bool(re.search(r'(?i)\b(video|clip|footage|film)\b', clean_prompt))
-        if not has_video_word:
-            prompt_with_duration = f"Generate a 10 second video: {clean_prompt}"
-        else:
-            # Prepend "10 second" hint at the start
-            prompt_with_duration = f"10 second video: {clean_prompt}"
-        
-        log(f"[V7] Clean prompt: {prompt_with_duration[:120]}...")
+        # ── FINAL PROMPT ASSEMBLY ──
+        # Prefix: "Create 10s video:" — tells Dola UI it's 10s (no duration warning dialog)
+        # Backend: API hook (V7) intercepts the generation request and patches duration 10→15s silently
+        # This works for ALL ratios and ALL prompt types.
+        #
+        # Clean up any leftover video/create prefix from prompt before adding ours
+        clean_prompt = re.sub(r'(?i)^(create\s+\d+s?\s+video|generate\s+a\s+video|generate\s+video|video)\s*:\s*', '', clean_prompt).strip()
+        # Final: always prefix with "Create 10s video:"
+        prompt_with_duration = f"Create 10s video: {clean_prompt}"
+
+
 
         log("Navigating to Dola...")
         try:
@@ -782,11 +977,12 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
         
         await asyncio.sleep(0.5)
         
-        log("Selecting 'Video' tab or mode...")
+        # Selecting Video tab silently
         video_clicked = False
         
-        # Dismiss any popups/login modals first
-        await dismiss_popups(page)
+        # Dismiss any popups/login modals AGGRESSIVELY before Video tab click
+        await dismiss_popups_aggressive(page)
+
         await asyncio.sleep(0.3)
         
         # Wait for page to be fully loaded
@@ -798,7 +994,7 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
                 if attempt < 1:
                     await asyncio.sleep(1)
                 else:
-                    log("[-] Page still not fully loaded, proceeding anyway...")
+                    pass  # page still loading
         
         # Comprehensive selectors for Video tab (desktop + mobile views)
         video_selectors = [
@@ -821,7 +1017,7 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
                     await asyncio.sleep(0.2)
                     await el.click(force=True, timeout=3000)
                     video_clicked = True
-                    log(f"[+] Clicked Video mode using: {sel}")
+
                     break
             except:
                 pass
@@ -840,7 +1036,7 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
                             if await sub_el.is_visible(timeout=2000):
                                 await sub_el.click(force=True, timeout=2000)
                                 video_clicked = True
-                                log("[+] Clicked Video inside More menu!")
+
                                 break
                         except:
                             pass
@@ -881,7 +1077,7 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
 
         # ── Explicitly select 10s duration from the dropdown ──
         # The UI default may be 5s. We must select 10s so the hook can change it to 15s.
-        log("Selecting 10s duration from dropdown...")
+        # Selecting duration silently
         duration_set = False
         
         # Method 1: Click on duration button/dropdown (shows "5s" or "10s" text)
@@ -932,69 +1128,148 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
         await asyncio.sleep(0.3)
 
         # ── Explicitly select aspect ratio from UI ──
-        log(f"Selecting aspect ratio {ratio}...")
+        # Using page.mouse.click() with screen coords — most reliable for Radix UI dropdowns
+        # Selecting aspect ratio silently
         ratio_set = False
-        
-        # Try to find and click ratio selector
-        ratio_trigger_selectors = [
-            "[class*='ratio']",
-            "[class*='aspect']",
-            "button:has-text('16:9')",
-            "button:has-text('9:16')",
-            "button:has-text('1:1')",
-            "div:has-text('16:9'):near(button:has-text('Video'))",
-            "span:has-text('16:9')",
-        ]
-        
-        for sel in ratio_trigger_selectors:
+        await asyncio.sleep(0.5)
+
+        for ratio_attempt in range(3):  # Try up to 3 times
             try:
-                el = page.locator(sel).first
-                if await el.is_visible(timeout=1000):
-                    await el.click(force=True, timeout=1000)
-                    log(f"[+] Clicked ratio trigger: {sel}")
-                    await asyncio.sleep(0.5)
-                    
-                    # Now try to select target ratio from dropdown
-                    target_ratio_selectors = [
-                        f"text='{ratio}'",
-                        f"div:has-text('{ratio}')",
-                        f"span:has-text('{ratio}')",
-                        f"li:has-text('{ratio}')",
-                        f"button:has-text('{ratio}')",
-                    ]
-                    for rs in target_ratio_selectors:
-                        try:
-                            ratio_el = page.locator(rs).last
-                            if await ratio_el.is_visible(timeout=1000):
-                                await ratio_el.click(force=True, timeout=1000)
-                                log(f"[+] Selected {ratio} aspect ratio!")
+                # Step 1: Find Ratio button and click it
+                ratio_btn = page.locator("button:has-text('Ratio')").first
+                if not await ratio_btn.is_visible(timeout=2000):
+                    log("[-] Ratio button not visible on page")
+                    break
+
+                bbox = await ratio_btn.bounding_box()
+                if not bbox:
+                    log("[-] Ratio button has no bounding box")
+                    break
+
+                cx = bbox['x'] + bbox['width'] / 2
+                cy = bbox['y'] + bbox['height'] / 2
+                await page.mouse.click(cx, cy)
+
+
+                # Step 2: Wait for dropdown
+                try:
+                    await page.wait_for_selector("div[role='menuitem']", state="visible", timeout=3000)
+
+                except:
+                    log("[-] wait_for_selector timed out — trying anyway")
+                    await asyncio.sleep(1.0)
+
+                # Step 3: Click target menuitem
+                all_items = await page.locator("div[role='menuitem']").all()
+                if not all_items:
+                    log(f"[-] Found 0 menuitems (attempt {ratio_attempt+1}/3) — retrying...")
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(1.0)
+                    continue
+
+                target_found = False
+                for item in all_items:
+                    try:
+                        txt = (await item.text_content() or "").strip()
+                        visible = await item.is_visible()
+                        if txt == ratio and visible:
+                            ibbox = await item.bounding_box()
+                            if ibbox:
+                                ix = ibbox['x'] + ibbox['width'] / 2
+                                iy = ibbox['y'] + ibbox['height'] / 2
+                                await page.mouse.click(ix, iy)
+                                log(f"[+] Ratio {ratio} set!")
                                 ratio_set = True
+                                await asyncio.sleep(0.4)
+                                target_found = True
                                 break
-                        except:
-                            pass
-                    
-                    if ratio_set:
+                    except Exception as ie:
+                        log(f"[-] menuitem error: {ie}")
+
+                if target_found:
+                    break  # Success
+
+                # Fallback: try clicking by text directly
+                try:
+                    direct = page.locator(f"div[role='menuitem']:has-text('{ratio}')").first
+                    if await direct.is_visible(timeout=1000):
+                        await direct.click(force=True)
+                        log(f"[+] Clicked '{ratio}' via direct text selector!")
+                        ratio_set = True
                         break
-            except:
-                pass
+                except:
+                    pass
+
+                log(f"[-] Could not find visible '{ratio}' menuitem (attempt {ratio_attempt+1}/3)")
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(1.0)
+
+            except Exception as e:
+                log(f"[-] Ratio selection exception (attempt {ratio_attempt+1}): {e}")
+                await asyncio.sleep(0.5)
         
         if not ratio_set:
-            log(f"[-] WARNING: Could not set ratio to {ratio} via UI. Hook will force it in API payload.")
+            log(f"[-] WARNING: Ratio {ratio} not set via UI. API hook will force it.")
         
         await asyncio.sleep(0.3)
+
+
 
         log("Entering prompt...")
         try:
             # Wait for the chat UI to load
-            try:
-                await page.wait_for_selector("div[role='textbox'], textarea", state="attached", timeout=15000)
-            except:
-                pass
-                
-            # Find the last VISIBLE input box
-            target_tb = page.locator("div[role='textbox']:visible, textarea:visible").last
-                    
-            if await target_tb.is_visible(timeout=5000):
+             # Find the chat input textbox — try multiple selectors with retries
+            TB_SELECTORS = [
+                "div[role='textbox']:visible",
+                "div[contenteditable='true']:visible",
+                "textarea:visible",
+                "[placeholder*='message']:visible",
+                "[placeholder*='Ask']:visible",
+                "[placeholder*='Type']:visible",
+                "[class*='input']:visible[contenteditable]",
+                "[class*='chat'] div[contenteditable]:visible",
+                "[class*='Input'] textarea:visible",
+            ]
+
+            target_tb = None
+            for _attempt in range(3):
+                for sel in TB_SELECTORS:
+                    try:
+                        el = page.locator(sel).last
+                        if await el.is_visible(timeout=3000):
+                            target_tb = el
+                            break
+                    except:
+                        continue
+                if target_tb:
+                    break
+                # Wait and retry if page is still loading
+                log(f"[i] Textbox not found on attempt {_attempt+1}/3, waiting 3s...")
+                await asyncio.sleep(3)
+
+            # JS fallback: find any contenteditable/input that's visible
+            if not target_tb:
+                try:
+                    found_sel = await page.evaluate("""() => {
+                        const candidates = [
+                            ...document.querySelectorAll('div[contenteditable], textarea, input[type="text"]')
+                        ];
+                        for (const el of candidates) {
+                            const r = el.getBoundingClientRect();
+                            if (r.width > 50 && r.height > 20 && el.offsetParent !== null) {
+                                el.focus();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }""")
+                    if found_sel:
+                        target_tb = page.locator("*:focus").first
+                        log("[i] Textbox found via JS focus fallback")
+                except:
+                    pass
+
+            if target_tb and await target_tb.is_visible(timeout=2000):
                 await target_tb.click(force=True)
                 await asyncio.sleep(0.5)
                 
@@ -1045,7 +1320,7 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
                     submit_ok = True  # Can't check = assume it worked
                 
                 if not submit_ok:
-                    log("[i] Enter may not have fired. Retrying...")
+                    # Enter may not have fired — retrying silently
                     # Retry 1: Re-click textbox + Enter
                     try:
                         await target_tb.click(force=True)
@@ -1092,7 +1367,7 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
         # ── AUTO-DISMISS POPUPS / CONFIRMATION DIALOGS ──
         # Dola may show popups like "video longer than 10s not supported, continue?"
         # We auto-click Yes/Continue/OK to dismiss them
-        log("Checking for confirmation popups...")
+        # Checking for confirmation popups silently
         await asyncio.sleep(2)  # Wait for popup to appear
         
         popup_buttons = [
@@ -1159,9 +1434,9 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
         if not popup_dismissed:
             log("[i] No popups detected (or none needed dismissal)")
             
-        # ── 60-SECOND PROCESS START CHECK ──
-        # If prompt is pasted but no generation activity detected in 60s, auto-close browser
-        log("Checking if generation process started (60s timeout)...")
+        # ── PROCESS START CHECK (configurable, default 60s) ──
+        # If prompt is pasted but no generation activity detected, auto-close browser
+        # Checking if generation process started
         process_started = False
         process_check_start = time.time()
         
@@ -1174,7 +1449,7 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
         except Exception:
             pass
         
-        while time.time() - process_check_start < 60:
+        while time.time() - process_check_start < process_start_timeout:
             if stop_check and stop_check():
                 err_log("[-] Stopped by user during process start check.")
                 if context: await context.close()
@@ -1231,6 +1506,16 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
                         break
                 except Exception:
                     pass
+
+                # Check 2.2: Text confirmations from Dola (e.g. Dreamina, Seedance, will be generated)
+                try:
+                    body_text = await page.inner_text("body")
+                    if any(x in body_text for x in ["Dreamina", "Seedance", "will be generated", "generating your video", "generating the video"]):
+                        process_started = True
+                        log("[+] Generation process detected (Dola text confirmation found)!")
+                        break
+                except Exception:
+                    pass
                 
                 # Check 3: Video element already appeared (fast generation)
                 try:
@@ -1259,10 +1544,10 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
             await asyncio.sleep(1)
             elapsed_check = int(time.time() - process_check_start)
             if elapsed_check > 0 and elapsed_check % 10 == 0:
-                log(f"... still checking for process start ({elapsed_check}s / 60s) ...")
+                log(f"... still checking for process start ({elapsed_check}s / {process_start_timeout}s) ...")
         
         if not process_started:
-            err_log("[-] ERROR: Process did not start within 60 seconds after prompt paste. Auto-closing browser.")
+            err_log(f"[-] ERROR: Process did not start within {process_start_timeout}s after prompt paste. Auto-closing browser.")
             try:
                 await page.screenshot(path=f"error_no_process_{instance_id}.png")
                 log(f"[-] Saved error_no_process_{instance_id}.png to debug.")
@@ -1313,22 +1598,90 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
                 high_demand = await page.locator("text=experiencing high demand").is_visible() or "from_logout=1" in page.url
                 try_again_later = await page.locator("text=try again later").is_visible()
                 
-                # NOTE: We do NOT reply to duration limit warnings anymore.
-                # Replying "Yes" causes Dola to make 5s videos.
-                # Instead, the prompt is pre-cleaned to never trigger this warning.
-                # If it still appears, we just log it and keep waiting (Dola usually
-                # continues generating anyway after showing the warning).
-                limit_texts = [
-                    "longer than 10 seconds is not supported",
-                    "currently generating videos longer",
-                    "do you want to continue generating",
-                ]
-                for lt in limit_texts:
-                    try:
-                        if await page.locator(f"text={lt}").first.is_visible(timeout=200):
-                            break
-                    except:
-                        pass
+                # ── DURATION LIMIT DIALOG — SMART AUTO-DISMISS ──
+                # Primary fix = clean prompt (no timestamps). This is safety net.
+                # If dialog still appears → auto-click Continue ONCE to unblock.
+                if not hasattr(run_bot, '_duration_dismiss_counts'):
+                    run_bot._duration_dismiss_counts = {}
+                dismiss_key = instance_id
+                duration_dismiss_count = run_bot._duration_dismiss_counts.get(dismiss_key, 0)
+
+                if duration_dismiss_count < 2:
+                    limit_texts = [
+                        "longer than 10 seconds is not supported",
+                        "currently generating videos longer",
+                        "do you want to continue generating",
+                        "10-second video for you",
+                    ]
+                    for lt in limit_texts:
+                        try:
+                            if await page.locator(f"text={lt}").first.is_visible(timeout=200):
+                                log("[!] Duration dialog detected — auto-clicking Continue to unblock...")
+                                dismissed = False
+
+                                # Try all possible button texts and selectors
+                                btn_selectors = [
+                                    ("button:has-text('Continue')", "Continue"),
+                                    ("button:has-text('Yes')", "Yes"),
+                                    ("button:has-text('OK')", "OK"),
+                                    ("button:has-text('Generate')", "Generate"),
+                                    ("button:has-text('continue generating')", "continue generating"),
+                                    ("button:has-text('Proceed')", "Proceed"),
+                                    # Non-button elements
+                                    ("div:has-text('Continue'):not(:has(div))", "div Continue"),
+                                    ("span:has-text('Yes')", "span Yes"),
+                                    ("[role='button']:has-text('Yes')", "role button Yes"),
+                                    ("[role='button']:has-text('Continue')", "role button Continue"),
+                                ]
+                                for sel, label in btn_selectors:
+                                    try:
+                                        btn = page.locator(sel).first
+                                        if await btn.is_visible(timeout=300):
+                                            bbox = await btn.bounding_box()
+                                            if bbox:
+                                                await page.mouse.click(
+                                                    bbox['x'] + bbox['width'] / 2,
+                                                    bbox['y'] + bbox['height'] / 2
+                                                )
+                                                log(f"[+] Duration dialog dismissed — clicked '{label}'!")
+                                                dismissed = True
+                                                run_bot._duration_dismiss_counts[dismiss_key] = duration_dismiss_count + 1
+                                                await asyncio.sleep(1.0)
+                                                break
+                                    except:
+                                        pass
+
+                                if not dismissed:
+                                    # Try JS click on any visible button containing confirm text
+                                    try:
+                                        clicked = await page.evaluate("""() => {
+                                            const texts = ['Continue', 'Yes', 'OK', 'Generate', 'Proceed', 'continue generating'];
+                                            for (const t of texts) {
+                                                const els = [...document.querySelectorAll('button, [role="button"], a')];
+                                                for (const el of els) {
+                                                    if (el.textContent && el.textContent.trim().toLowerCase().includes(t.toLowerCase()) && el.offsetParent !== null) {
+                                                        el.click();
+                                                        return 'clicked: ' + el.textContent.trim();
+                                                    }
+                                                }
+                                            }
+                                            return null;
+                                        }""")
+                                        if clicked:
+                                            log(f"[+] Duration dialog dismissed via JS: {clicked}")
+                                            dismissed = True
+                                            run_bot._duration_dismiss_counts[dismiss_key] = duration_dismiss_count + 1
+                                    except:
+                                        pass
+
+                                if not dismissed:
+                                    # Dialog is informational text only — no button exists.
+                                    # Mark as handled so we don't loop forever. Generation continues anyway.
+                                    log("[i] Duration msg is text-only (no button). Ignoring and continuing.")
+                                    run_bot._duration_dismiss_counts[dismiss_key] = 99  # Stop retrying
+                                break
+                        except:
+                            pass
                 
                 # Check if Dola generated IMAGES instead of video
                 try:
@@ -1540,16 +1893,15 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
             if video_url:
                 break
                 
-            # Method 4: Check network captured urls
+            # Method 4: Check network captured URLs
+            # video_urls_captured was cleared before prompt submission — any URL here is the NEW video
             if len(video_urls_captured) > 0:
-                for u in video_urls_captured:
-                    if u not in initial_video_srcs:
-                        video_url = u
-                        log("[+] Found new video URL in network requests!")
-                        break
-                if video_url:
-                    break
-                
+                # Take the LAST captured URL (most recent = the just-generated video)
+                candidate = video_urls_captured[-1]
+                video_url = candidate
+                log(f"[+] Found new video URL via network capture! ({candidate[:60]}...)")
+                break
+
             await asyncio.sleep(1)
             # Only print still waiting every 5 seconds roughly
             elapsed_int = int(time.time() - start_time - paused_time)
@@ -1580,77 +1932,57 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
             log(f"Downloading to {video_path}...")
             
             download_success = False
-            
-            try:
-                log("[+] Attempting download via Playwright API...")
-                if video_url.startswith("blob:"):
-                    js_fetch = """
-                    async (url) => {
-                        const response = await fetch(url);
-                        const blob = await response.blob();
-                        return new Promise((resolve, reject) => {
-                            const reader = new FileReader();
-                            reader.onloadend = () => resolve(reader.result);
-                            reader.onerror = reject;
-                            reader.readAsDataURL(blob);
-                        });
-                    }
-                    """
-                    b64_data = await page.evaluate(js_fetch, video_url)
-                    if b64_data and "," in b64_data:
-                        import base64
-                        b64_str = b64_data.split(",")[1]
-                        video_bytes = base64.b64decode(b64_str)
-                        with open(video_path, "wb") as f:
-                            f.write(video_bytes)
-                        log(f"[+] SUCCESS! Video downloaded via browser to: {video_path}")
-                        download_success = True
-                else:
-                    resp = await page.request.get(video_url, timeout=30000)
-                    if resp.ok:
-                        video_bytes = await resp.body()
-                        with open(video_path, "wb") as f:
-                            f.write(video_bytes)
-                        log(f"[+] SUCCESS! Video downloaded via page.request to: {video_path}")
-                        download_success = True
-                    else:
-                        raise ValueError(f"HTTP {resp.status} - {resp.status_text}")
-            except Exception as e:
-                err_log(f"[-] ERROR with Playwright download: {e}. Trying requests fallback...")
-                
+
             if not download_success:
                 try:
-                    if video_url.startswith("blob:") or not video_url.startswith("http"):
-                        raise ValueError(f"Invalid URL for requests: {video_url}")
-                        
-                    r = requests.get(video_url, timeout=30)
-                    r.raise_for_status()
-                    with open(video_path, "wb") as f:
-                        f.write(r.content)
-                    log(f"[+] SUCCESS! Video downloaded via requests to: {video_path}")
-                    download_success = True
-                except Exception as e:
-                    err_log(f"[-] ERROR with requests download: {e}. Trying final fallback...")
-                    
-                if not download_success:
-                    try:
-                        # Fallback 1: Extract any raw .mp4 link from the entire page source
-                        html_content = await page.content()
-                        import re
-                        mp4_links = re.findall(r'https?://[^\'"\s\\]+\.mp4', html_content)
-                        if mp4_links:
-                            fallback_url = mp4_links[0]
-                            log(f"[+] Found hidden MP4 link in page: {fallback_url[:80]}...")
-                            r = requests.get(fallback_url, timeout=30)
-                            r.raise_for_status()
-                            with open(video_path, "wb") as f:
-                                f.write(r.content)
-                            log(f"[+] SUCCESS! Video downloaded via fallback to: {video_path}")
+                    log('[+] Attempting download via Playwright API...')
+                    if video_url.startswith('blob:'):
+                        js_fetch = '''
+                        async (url) => {
+                            const response = await fetch(url);
+                            const blob = await response.blob();
+                            return new Promise((resolve, reject) => {
+                                const reader = new FileReader();
+                                reader.onloadend = () => resolve(reader.result);
+                                reader.onerror = reject;
+                                reader.readAsDataURL(blob);
+                            });
+                        }
+                        '''
+                        b64_data = await page.evaluate(js_fetch, video_url)
+                        if b64_data and ',' in b64_data:
+                            import base64
+                            b64_str = b64_data.split(',')[1]
+                            video_bytes = base64.b64decode(b64_str)
+                            with open(video_path, 'wb') as f:
+                                f.write(video_bytes)
+                            log(f'[+] SUCCESS! Downloaded via browser to: {video_path}')
+                            download_success = True
+                    else:
+                        resp = await page.request.get(video_url, timeout=30000)
+                        if resp.ok:
+                            video_bytes = await resp.body()
+                            with open(video_path, 'wb') as f:
+                                f.write(video_bytes)
+                            log(f'[+] SUCCESS! Downloaded via page.request to: {video_path}')
                             download_success = True
                         else:
-                            err_log("[-] No .mp4 links found in the page source either.")
-                    except Exception as e2:
-                        err_log(f"[-] Fallback download failed: {e2}")
+                            raise ValueError(f'HTTP {resp.status}')
+                except Exception as e:
+                    err_log(f'[-] Playwright download error: {e}. Trying fallback...')
+
+            if not download_success:
+                try:
+                    if not video_url.startswith('http'):
+                        raise ValueError(f'Invalid URL: {video_url}')
+                    r = requests.get(video_url, timeout=30)
+                    r.raise_for_status()
+                    with open(video_path, 'wb') as f:
+                        f.write(r.content)
+                    log(f'[+] SUCCESS! Downloaded via requests to: {video_path}')
+                    download_success = True
+                except Exception as e:
+                    err_log(f'[-] requests download error: {e}')
         
             if caption:
                 txt_path = os.path.join(output_dir, filename_base + ".txt")
@@ -1757,7 +2089,6 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
             err_log("[-] ERROR: Failed to get video URL within timeout.")
             try:
                 await page.screenshot(path=f"error_timeout_{instance_id}.png")
-                log(f"[-] Saved error_timeout_{instance_id}.png to debug.")
             except:
                 pass
             # Close browser context reliably

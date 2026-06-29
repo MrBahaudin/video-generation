@@ -62,7 +62,8 @@ class DolaBotWorker(QThread):
 
     def __init__(self, prompt_data, duration, total, concurrency, output_dir,
                  wait_timeout=600, start_delay=2, next_delay=5,
-                 headless=True, watermark_mode="Blur (Delogo)", proxy_list=None, mobile_mode=True, naming_mode="Title in CSV"):
+                 headless=True, watermark_mode="Blur (Delogo)", proxy_list=None, mobile_mode=True, naming_mode="Title in CSV",
+                 process_start_timeout=60, ratio="9:16"):
         super().__init__()
         self.prompt_data = prompt_data
         self.duration = duration
@@ -78,6 +79,8 @@ class DolaBotWorker(QThread):
         self.proxy_list = proxy_list or []
         self.mobile_mode = mobile_mode
         self.naming_mode = naming_mode
+        self.process_start_timeout = process_start_timeout
+        self.ratio = ratio
         self._is_stopped = False
         self._failed_prompts = []  # Track failed prompts for retry
 
@@ -142,8 +145,7 @@ class DolaBotWorker(QThread):
                     self.stats_signal.emit(self.total, queued, active, successes, failed)
 
                     if self.next_delay > 0:
-                        self.log(f"[Bot {instance_id}] Waiting {self.next_delay}s before next task...")
-                        # Uninterruptible sleep replaced with a loop to check stop flag
+                        # Waiting before next task (silent)
                         for _ in range(self.next_delay):
                             if self._is_stopped:
                                 if is_generating:
@@ -168,6 +170,7 @@ class DolaBotWorker(QThread):
                             browser=browser,
                             prompt_text=prompt_text,
                             duration=self.duration,
+                            ratio=self.ratio,
                             instance_id=instance_id,
                             watermark_mode=self.watermark_mode,
                             log_callback=self.log,
@@ -180,7 +183,8 @@ class DolaBotWorker(QThread):
                             proxy=proxy,
                             mobile_mode=self.mobile_mode,
                             naming_mode=self.naming_mode,
-                            on_generating_callback=on_generating
+                            on_generating_callback=on_generating,
+                            process_start_timeout=self.process_start_timeout
                         )
                         
                         if success:
@@ -369,11 +373,13 @@ class DolaVideoGenPage(QWidget):
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(2, 1)
+        grid.setColumnStretch(3, 1)
 
         # Row 0: Labels for Row 1
         grid.addWidget(QLabel("Duration"), 0, 0)
         grid.addWidget(QLabel("Concurrent Threads"), 0, 1)
-        grid.addWidget(QLabel("Timeout (min)"), 0, 2)
+        grid.addWidget(QLabel("Timeout (min)  ⓘ"), 0, 2)
+        grid.addWidget(QLabel("Process Start (s)  ⓘ"), 0, 3)
 
         # Row 1: Inputs
         self._dur_combo = QComboBox()
@@ -387,7 +393,20 @@ class DolaVideoGenPage(QWidget):
         self._timeout_entry = QLineEdit()
         self._timeout_entry.setText("30")
         self._timeout_entry.textChanged.connect(self._update_dynamic_timeout)
+        self._timeout_entry.setToolTip(
+            "Stage 2 Timeout: How long to wait for video URL to appear.\n"
+            "If video is not found in this time → prompt marked as failed."
+        )
         grid.addWidget(self._timeout_entry, 1, 2)
+
+        self._process_start_entry = QLineEdit()
+        self._process_start_entry.setText("80")
+        self._process_start_entry.setToolTip(
+            "Stage 1 Timeout: How long to wait for Dola to START processing.\n"
+            "If no generation activity detected in this time → browser auto-closes.\n"
+            "Default: 80s. Increase if your internet is slow."
+        )
+        grid.addWidget(self._process_start_entry, 1, 3)
 
         # Add vertical spacing between grid rows
         grid.setRowMinimumHeight(1, grid.rowMinimumHeight(1) + 6)
@@ -396,6 +415,7 @@ class DolaVideoGenPage(QWidget):
         grid.addWidget(QLabel("Start Delay (s)"), 2, 0)
         grid.addWidget(QLabel("Next Task Delay (s)"), 2, 1)
         grid.addWidget(QLabel("Watermark Removal"), 2, 2)
+        grid.addWidget(QLabel("Aspect Ratio"), 2, 3)
 
         # Row 3: Inputs
         self._delay_entry = QLineEdit()
@@ -410,7 +430,86 @@ class DolaVideoGenPage(QWidget):
         self._watermark_combo.addItems(["Blur (Delogo)", "Crop", "None"])
         grid.addWidget(self._watermark_combo, 3, 2)
 
+        self._ratio_combo = QComboBox()
+        self._ratio_combo.addItems(["9:16", "16:9", "1:1", "4:3", "3:4", "21:9"])
+        self._ratio_combo.setToolTip(
+            "Video aspect ratio:\n"
+            "9:16 — Vertical (TikTok, Reels, Shorts)\n"
+            "16:9 — Horizontal (YouTube, landscape)\n"
+            "1:1  — Square (Instagram post)\n"
+            "4:3  — Classic landscape\n"
+            "3:4  — Portrait"
+        )
+        grid.addWidget(self._ratio_combo, 3, 3)
+
         lay.addLayout(grid)
+
+        # ── Timeout Info Panel ──
+        timeout_info = QFrame()
+        timeout_info.setStyleSheet(
+            "QFrame { background: rgba(96,165,250,0.07); border: 1px solid rgba(96,165,250,0.18); border-radius: 6px; }"
+        )
+        ti_lay = QVBoxLayout(timeout_info)
+        ti_lay.setContentsMargins(12, 8, 12, 8)
+        ti_lay.setSpacing(4)
+
+        ti_title = QLabel("⏱  How Timeout Works")
+        ti_title.setStyleSheet("color: #60a5fa; font-size: 10px; font-weight: 700; background: transparent; border: none;")
+        ti_lay.addWidget(ti_title)
+
+        stage1_row = QHBoxLayout()
+        s1_badge = QLabel("STAGE 1")
+        s1_badge.setStyleSheet(
+            "color: #f59e0b; font-size: 9px; font-weight: 700; "
+            "background: rgba(245,158,11,0.15); border: 1px solid rgba(245,158,11,0.3); "
+            "border-radius: 3px; padding: 1px 5px;"
+        )
+        s1_badge.setFixedWidth(52)
+        self._stage1_info_lbl = QLabel("80s - waits for Dola to START processing your prompt")
+        self._stage1_info_lbl.setStyleSheet("color: #94a3b8; font-size: 10px; background: transparent; border: none;")
+        stage1_row.addWidget(s1_badge)
+        stage1_row.addSpacing(6)
+        stage1_row.addWidget(self._stage1_info_lbl)
+        stage1_row.addStretch()
+        ti_lay.addLayout(stage1_row)
+
+        stage2_row = QHBoxLayout()
+        s2_badge = QLabel("STAGE 2")
+        s2_badge.setStyleSheet(
+            "color: #10b981; font-size: 9px; font-weight: 700; "
+            "background: rgba(16,185,129,0.15); border: 1px solid rgba(16,185,129,0.3); "
+            "border-radius: 3px; padding: 1px 5px;"
+        )
+        s2_badge.setFixedWidth(52)
+        self._timeout_info_lbl = QLabel("30 min — waits for video URL to appear (your Timeout setting)")
+        self._timeout_info_lbl.setStyleSheet("color: #94a3b8; font-size: 10px; background: transparent; border: none;")
+        stage2_row.addWidget(s2_badge)
+        stage2_row.addSpacing(6)
+        stage2_row.addWidget(self._timeout_info_lbl)
+        stage2_row.addStretch()
+        ti_lay.addLayout(stage2_row)
+
+        fail_row = QHBoxLayout()
+        f_badge = QLabel("FAIL")
+        f_badge.setStyleSheet(
+            "color: #ef4444; font-size: 9px; font-weight: 700; "
+            "background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.3); "
+            "border-radius: 3px; padding: 1px 5px;"
+        )
+        f_badge.setFixedWidth(52)
+        f_desc = QLabel("If video not found in Stage 2 time → browser closes, prompt marked as failed")
+        f_desc.setStyleSheet("color: #94a3b8; font-size: 10px; background: transparent; border: none;")
+        fail_row.addWidget(f_badge)
+        fail_row.addSpacing(6)
+        fail_row.addWidget(f_desc)
+        fail_row.addStretch()
+        ti_lay.addLayout(fail_row)
+
+        lay.addWidget(timeout_info)
+
+        # Connect timeout fields to update info labels live
+        self._timeout_entry.textChanged.connect(self._update_timeout_info_label)
+        self._process_start_entry.textChanged.connect(self._update_stage1_info_label)
 
         lay.addSpacing(8)
 
@@ -418,15 +517,16 @@ class DolaVideoGenPage(QWidget):
         row3 = QHBoxLayout()
         row3.setSpacing(24)
 
-        # NOTE: Loop and Mobile Emulation hidden; Hide Browser visible
+        # NOTE: Loop, Mobile Emulation, and Hide Browser are all hidden
         self._loop_cb = QCheckBox("Auto-Loop Batch")
         self._loop_cb.setChecked(False)
         self._loop_cb.hide()
 
+        # Browser is always headless (hidden) — no user toggle needed
         self._headless_cb = QCheckBox("Hide Browser")
         self._headless_cb.setChecked(True)
-        row3.addWidget(self._headless_cb)
-        
+        self._headless_cb.hide()
+
         self._mobile_cb = QCheckBox("Mobile Emulation")
         self._mobile_cb.setChecked(False)
         self._mobile_cb.hide()
@@ -652,13 +752,20 @@ class DolaVideoGenPage(QWidget):
 
     # ─── Settings Persistence ──────────────────────────
 
+    def _get_safe_default_folder(self):
+        """Return a safe writable default output folder on the user's Desktop."""
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop", "ZakariyaAutomator Videos")
+        return desktop
+
     def _load_settings(self):
         s = load_settings()
         ud = load_user_data()
         self._folder_entry.setText("")  # Do not load saved location
         self._conc_entry.setText(s.get("concurrency", "20"))
         self._dur_combo.setCurrentText(s.get("duration", "15s"))
+        self._ratio_combo.setCurrentText(s.get("ratio", "9:16"))
         self._timeout_entry.setText(s.get("timeout_min", "30"))
+        self._process_start_entry.setText(s.get("process_start_timeout", "80"))
         self._delay_entry.setText(s.get("start_delay", "5"))
         self._next_delay_entry.setText(s.get("next_delay", "5"))
         self._headless_cb.setChecked(s.get("show_browser", True))
@@ -675,7 +782,9 @@ class DolaVideoGenPage(QWidget):
         s = load_settings()
         s["concurrency"] = self._conc_entry.text()
         s["duration"] = self._dur_combo.currentText()
+        s["ratio"] = self._ratio_combo.currentText()
         s["timeout_min"] = self._timeout_entry.text()
+        s["process_start_timeout"] = self._process_start_entry.text()
         s["start_delay"] = self._delay_entry.text()
         s["next_delay"] = self._next_delay_entry.text()
         s["show_browser"] = self._headless_cb.isChecked()
@@ -996,7 +1105,28 @@ class DolaVideoGenPage(QWidget):
             except ValueError:
                 pass
 
+    def _update_timeout_info_label(self, text):
+        """Update the Stage 2 label in the timeout info panel live."""
+        try:
+            mins = int(text)
+            self._timeout_info_lbl.setText(
+                f"{mins} min — waits for video URL to appear (your Timeout setting)"
+            )
+        except (ValueError, AttributeError):
+            pass
+
+    def _update_stage1_info_label(self, text):
+        """Update the Stage 1 label in the timeout info panel live."""
+        try:
+            secs = int(text)
+            self._stage1_info_lbl.setText(
+                f"{secs}s — waits for Dola to START processing your prompt"
+            )
+        except (ValueError, AttributeError):
+            pass
+
     # ─── Batch Control ─────────────────────────────────
+
 
     def _stop_batch(self):
         if self._worker and not self._worker._is_stopped:
@@ -1066,9 +1196,49 @@ class DolaVideoGenPage(QWidget):
             return
 
         out_dir = self._folder_entry.text().strip()
-        if not out_dir or not os.path.exists(out_dir):
-            QMessageBox.warning(self, "Error", "Please select a valid Output Folder before starting!")
-            return
+
+        # ── Check for protected paths (e.g. Program Files) ──
+        protected_paths = [
+            os.environ.get("ProgramFiles", "C:\\Program Files"),
+            os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+            os.environ.get("SystemRoot", "C:\\Windows"),
+        ]
+        if out_dir and any(out_dir.lower().startswith(p.lower()) for p in protected_paths if p):
+            safe_default = self._get_safe_default_folder()
+            reply = QMessageBox.warning(
+                self, "Protected Folder Detected",
+                f"The selected folder is inside a Windows protected directory:\n\n"
+                f"  {out_dir}\n\n"
+                f"Files cannot be saved there without Administrator rights.\n\n"
+                f"Switch to safe default folder?\n  {safe_default}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                out_dir = safe_default
+                self._folder_entry.setText(out_dir)
+            else:
+                return
+
+        # ── If no folder selected, use safe default ──
+        if not out_dir:
+            out_dir = self._get_safe_default_folder()
+            self._folder_entry.setText(out_dir)
+            self._log(f"[*] No folder selected — using default: {out_dir}", "warn")
+
+        # ── Auto-create folder if it doesn't exist ──
+        if not os.path.exists(out_dir):
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+                self._log(f"[+] Created output folder: {out_dir}", "success")
+            except PermissionError:
+                QMessageBox.critical(
+                    self, "Permission Denied",
+                    f"Cannot create folder:\n{out_dir}\n\nPlease select a different folder."
+                )
+                return
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Could not create output folder:\n{e}")
+                return
 
         # Reset stats
         self._error_stats = {"timeout": 0, "captcha": 0, "policy": 0, "textbox": 0, "high_demand": 0}
@@ -1097,6 +1267,7 @@ class DolaVideoGenPage(QWidget):
             wait_timeout = int(self._timeout_entry.text()) * 60
             start_delay = int(self._delay_entry.text())
             next_delay = int(self._next_delay_entry.text())
+            process_start_timeout = max(10, int(self._process_start_entry.text()))
 
             self._save_settings()
 
@@ -1109,8 +1280,9 @@ class DolaVideoGenPage(QWidget):
             return
 
         duration = self._dur_combo.currentText()
+        ratio = self._ratio_combo.currentText()
         out_dir = self._folder_entry.text()
-        is_headless = self._headless_cb.isChecked()
+        is_headless = False  # Browser always visible (Hide Browser checkbox removed)
         watermark_mode = self._watermark_combo.currentText()
         naming_mode = self._naming_combo.currentText()
 
@@ -1126,21 +1298,16 @@ class DolaVideoGenPage(QWidget):
         self._status_badge.setText("● RUNNING")
         self._status_badge.setStyleSheet("color: #f59e0b; font-weight: 700; font-size: 10px;")
 
-        self._log("═══════════════════════════════════════════════", "info")
-        self._log("⚡ INITIALIZING MULTI-THREADED GENERATION", "info")
-        self._log(f"Tasks/Prompts: {total} | Concurrency: {concurrency}", "info")
-        self._log(f"Output: {out_dir} | Timeout: {wait_timeout}s | Headless: {is_headless} | Watermark: {watermark_mode} | Naming: {naming_mode}", "info")
-        if proxy_list:
-            self._log(f"Proxies: {len(proxy_list)} loaded (round-robin)", "info")
-        self._log(f"Mobile Emulation: {'ON (random device per instance)' if mobile_mode else 'OFF (desktop mode)'}", "info")
-        self._log("═══════════════════════════════════════════════", "info")
+        self._log(f"⚡ Starting {total} tasks | Concurrency: {concurrency} | Ratio: {ratio}", "info")
+        self._log(f"Output: {out_dir} | Watermark: {watermark_mode} | Naming: {naming_mode}", "info")
 
         self._progress_bar.setValue(0)
 
         self._worker = DolaBotWorker(
             prompt_data, duration, total, concurrency, out_dir,
             wait_timeout, start_delay, next_delay, is_headless, watermark_mode,
-            proxy_list=proxy_list, mobile_mode=mobile_mode, naming_mode=naming_mode
+            proxy_list=proxy_list, mobile_mode=mobile_mode, naming_mode=naming_mode,
+            process_start_timeout=process_start_timeout, ratio=ratio
         )
         self._worker.log_signal.connect(lambda msg, lvl: self._log(msg, lvl))
         self._worker.error_signal.connect(self._log_error)

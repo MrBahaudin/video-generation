@@ -87,9 +87,7 @@ def main():
     splash.set_progress(0.8)
     app.processEvents()
 
-    # ── Step 2: Skip updates on splash (moved to MainWindow) ──
-    splash.set_status("Starting...")
-
+    # ── Step 2: Finalize splash (updates handled by MainWindow) ──
     splash.set_status("Starting...")
     splash.set_progress(1.0)
     app.processEvents()
