@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zakariya Automator — Admin Dashboard</title>
+    <meta name="description" content="Live analytics dashboard for Zakariya Automator">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+    <!-- Header -->
+    <header class="header">
+        <div class="header-left">
+            <div class="logo">⚡</div>
+            <div>
+                <h1>Zakariya Automator</h1>
+                <p class="subtitle">Admin Analytics Dashboard</p>
+            </div>
+        </div>
+        <div class="header-right">
+            <div class="live-badge">
+                <span class="live-dot"></span>
+                LIVE
+            </div>
+            <div class="status-badge" id="connectionStatus">
+                <span class="status-dot"></span>
+                <span>Connecting...</span>
+            </div>
+            <div class="last-updated" id="lastUpdated">—</div>
+        </div>
+    </header>
+
+    <!-- Top KPI Strip -->
+    <div class="kpi-strip" id="kpiStrip">
+        <div class="kpi-card accent-purple">
+            <div class="kpi-icon">🎬</div>
+            <div class="kpi-body">
+                <div class="kpi-value" id="totalVideos">—</div>
+                <div class="kpi-label">Total Videos</div>
+                <div class="kpi-sub" id="totalAttempts">— attempts</div>
+            </div>
+        </div>
+        <div class="kpi-card accent-cyan">
+            <div class="kpi-icon">📅</div>
+            <div class="kpi-body">
+                <div class="kpi-value" id="todayVideos">—</div>
+                <div class="kpi-label">Today's Videos</div>
+                <div class="kpi-sub" id="todayRate">—% success</div>
+            </div>
+        </div>
+        <div class="kpi-card accent-green">
+            <div class="kpi-icon">⚡</div>
+            <div class="kpi-body">
+                <div class="kpi-value" id="onlineUsers">—</div>
+                <div class="kpi-label">Active Users</div>
+                <div class="kpi-sub" id="generatingNow">— generating</div>
+            </div>
+        </div>
+        <div class="kpi-card accent-blue">
+            <div class="kpi-icon">⏱️</div>
+            <div class="kpi-body">
+                <div class="kpi-value" id="avgTime">—</div>
+                <div class="kpi-label">Avg Time / Video</div>
+                <div class="kpi-sub">per generation</div>
+            </div>
+        </div>
+        <div class="kpi-card accent-orange">
+            <div class="kpi-icon">📊</div>
+            <div class="kpi-body">
+                <div class="kpi-value" id="successRate">—</div>
+                <div class="kpi-label">Success Rate</div>
+                <div class="kpi-sub" id="totalFailed">— failed</div>
+            </div>
+        </div>
+        <div class="kpi-card accent-red">
+            <div class="kpi-icon">🚀</div>
+            <div class="kpi-body">
+                <div class="kpi-value" id="videosPerHour">—</div>
+                <div class="kpi-label">Videos / Hour</div>
+                <div class="kpi-sub">current rate</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Grid -->
+    <div class="main-grid">
+
+        <!-- LEFT COLUMN -->
+        <div class="left-col">
+
+            <!-- Hourly Activity Chart -->
+            <div class="card">
+                <div class="card-header">
+                    <h2>📈 Hourly Activity</h2>
+                    <span class="badge-pill" id="chartBadge">Last 24h</span>
+                </div>
+                <div class="card-body chart-body">
+                    <div class="chart-wrap">
+                        <div class="chart-bars" id="hourlyChart"></div>
+                        <div class="chart-labels" id="hourlyLabels"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Error Breakdown -->
+            <div class="card">
+                <div class="card-header">
+                    <h2>🔍 Error Breakdown</h2>
+                    <span class="badge-pill" id="totalErrorsBadge">0</span>
+                </div>
+                <div class="card-body">
+                    <div class="error-list" id="errorBreakdown"></div>
+                </div>
+            </div>
+
+            <!-- Performance Metrics -->
+            <div class="card">
+                <div class="card-header">
+                    <h2>⚡ Performance Metrics</h2>
+                </div>
+                <div class="card-body">
+                    <div class="perf-grid" id="perfMetrics"></div>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- RIGHT COLUMN -->
+        <div class="right-col">
+
+            <!-- Active Users (Live) -->
+            <div class="card">
+                <div class="card-header">
+                    <h2>🟢 Active Users</h2>
+                    <span class="badge-pill live-pill" id="onlineBadge">0</span>
+                </div>
+                <div class="card-body">
+                    <div id="onlineList" class="user-list">
+                        <div class="empty-state">No users online</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Recent Activity Feed -->
+            <div class="card">
+                <div class="card-header">
+                    <h2>📋 Live Feed</h2>
+                    <button class="btn-clear" onclick="clearEvents()">Clear</button>
+                </div>
+                <div class="card-body">
+                    <div id="eventList" class="event-list">
+                        <div class="empty-state">No recent events</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- App Versions -->
+            <div class="card">
+                <div class="card-header">
+                    <h2>📱 App Versions</h2>
+                </div>
+                <div class="card-body">
+                    <div id="versionList" class="version-list">
+                        <div class="empty-state">No version data</div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+    </div>
+
+    <!-- Full-Width: All Devices -->
+    <div class="card full-card" style="margin-top:20px">
+        <div class="card-header">
+            <h2>💻 All Devices</h2>
+            <span class="badge-pill" id="deviceBadge">0</span>
+        </div>
+        <div class="card-body" style="max-height:none">
+            <div id="deviceTable" class="device-table">
+                <div class="empty-state">No devices registered</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Firebase SDK -->
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>

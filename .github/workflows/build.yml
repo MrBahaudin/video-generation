@@ -50,12 +50,18 @@ jobs:
           body: |
             ## Zakariya Automator ${{ github.ref_name }}
             
-            ### Changes
-            - Auto-built from latest code
+            ### What's New in v1.2.1 — Download Fix
+            - **Fixed: Video download getting stuck** — Bot ab 4 alag methods se download karta hai
+            - **Method 1**: Dola's built-in download button click (browser native)
+            - **Method 2**: Playwright browser session (CDN cookies ke saath) — timeout 30s → **5 minutes**
+            - **Method 3**: Streaming download with 3 auto-retries (1MB chunks, no memory overflow)
+            - **Method 4**: XHR browser JS fallback (credentials included)
+            - Video generate hone ke baad download guaranteed hoga
             
             ### Installation
             1. Download `DolaVideoGen-${{ github.ref_name }}.zip`
             2. Extract and run `DolaVideoGen.exe`
+
           files: |
             DolaVideoGen-${{ steps.version.outputs.VERSION }}.zip
         env:

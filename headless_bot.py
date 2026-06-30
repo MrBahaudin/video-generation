@@ -143,6 +143,7 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
                 "device_scale_factor": device["device_scale_factor"],
                 "is_mobile": device["is_mobile"],
                 "has_touch": device["has_touch"],
+                "accept_downloads": True,  # Allow browser download events (needed for download button click)
             }
         else:
             ua = random.choice(DESKTOP_USER_AGENTS)
@@ -150,6 +151,7 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
             context_opts = {
                 "user_agent": ua,
                 "viewport": {"width": 1280, "height": 720},
+                "accept_downloads": True,  # Allow browser download events (needed for download button click)
             }
         # Add proxy if provided (format: "host:port" or "user:pass@host:port" or "socks5://host:port")
         if proxy:
@@ -1933,20 +1935,54 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
             
             download_success = False
 
+            # ── METHOD 1: Try clicking Dola's built-in Download button (triggers browser download) ──
+            if not download_success and not video_url.startswith('blob:'):
+                try:
+                    log('[+] Trying Dola download button click...')
+                    dl_btn_selectors = [
+                        "button[aria-label*='download' i]",
+                        "button[aria-label*='Download' i]",
+                        "[class*='download' i] button",
+                        "button:has-text('Download')",
+                        "a[download]",
+                        "[data-testid*='download']",
+                        "button svg[class*='download' i]",
+                        "button:has(svg[class*='download' i])",
+                    ]
+                    for dl_sel in dl_btn_selectors:
+                        try:
+                            dl_btn = page.locator(dl_sel).first
+                            if await dl_btn.is_visible(timeout=1500):
+                                async with page.expect_download(timeout=300000) as dl_info:
+                                    await dl_btn.click(force=True)
+                                dl = await dl_info.value
+                                await dl.save_as(video_path)
+                                log(f'[+] SUCCESS! Downloaded via browser download button to: {video_path}')
+                                download_success = True
+                                break
+                        except Exception:
+                            pass
+                except Exception as e:
+                    log(f'[i] Download button click failed: {e}. Trying next method...')
+
+            # ── METHOD 2: Playwright page.request with long timeout (uses browser cookies/session) ──
             if not download_success:
                 try:
-                    log('[+] Attempting download via Playwright API...')
+                    log('[+] Attempting download via Playwright API (browser session)...')
                     if video_url.startswith('blob:'):
+                        # Blob URL: fetch via browser JS and base64 encode
                         js_fetch = '''
                         async (url) => {
-                            const response = await fetch(url);
-                            const blob = await response.blob();
-                            return new Promise((resolve, reject) => {
-                                const reader = new FileReader();
-                                reader.onloadend = () => resolve(reader.result);
-                                reader.onerror = reject;
-                                reader.readAsDataURL(blob);
-                            });
+                            try {
+                                const response = await fetch(url);
+                                const blob = await response.blob();
+                                return new Promise((resolve, reject) => {
+                                    const reader = new FileReader();
+                                    reader.onloadend = () => resolve(reader.result);
+                                    reader.onerror = reject;
+                                    reader.readAsDataURL(blob);
+                                });
+                            } catch(e) { return null; }
                         }
                         '''
                         b64_data = await page.evaluate(js_fetch, video_url)
@@ -1956,33 +1992,89 @@ async def run_bot(browser, prompt_text, duration="15s", ratio="9:16", instance_i
                             video_bytes = base64.b64decode(b64_str)
                             with open(video_path, 'wb') as f:
                                 f.write(video_bytes)
-                            log(f'[+] SUCCESS! Downloaded via browser to: {video_path}')
+                            log(f'[+] SUCCESS! Downloaded blob via browser JS to: {video_path}')
                             download_success = True
+                        else:
+                            raise ValueError('Blob fetch returned no data')
                     else:
-                        resp = await page.request.get(video_url, timeout=30000)
+                        # CDN/HTTP URL: use page.request (inherits browser cookies + session)
+                        # Timeout = 5 minutes (300s) to handle large video files
+                        resp = await page.request.get(video_url, timeout=300000)
                         if resp.ok:
                             video_bytes = await resp.body()
                             with open(video_path, 'wb') as f:
                                 f.write(video_bytes)
-                            log(f'[+] SUCCESS! Downloaded via page.request to: {video_path}')
+                            log(f'[+] SUCCESS! Downloaded via page.request (browser session) to: {video_path}')
                             download_success = True
                         else:
-                            raise ValueError(f'HTTP {resp.status}')
+                            raise ValueError(f'HTTP {resp.status} from CDN')
                 except Exception as e:
-                    err_log(f'[-] Playwright download error: {e}. Trying fallback...')
+                    err_log(f'[-] Playwright page.request download error: {e}. Trying next method...')
+
+            # ── METHOD 3: Streaming requests with retry (fallback, no browser cookies) ──
+            if not download_success:
+                for attempt in range(3):
+                    try:
+                        if not video_url.startswith('http'):
+                            raise ValueError(f'Invalid URL for requests fallback: {video_url}')
+                        log(f'[+] Trying streaming requests download (attempt {attempt+1}/3)...')
+                        headers = {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+                            'Referer': 'https://www.dola.com/',
+                            'Origin': 'https://www.dola.com',
+                        }
+                        # Stream download to avoid loading full video into memory
+                        with requests.get(video_url, timeout=300, stream=True, headers=headers) as r:
+                            r.raise_for_status()
+                            total_bytes = 0
+                            with open(video_path, 'wb') as f:
+                                for chunk in r.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
+                                    if chunk:
+                                        f.write(chunk)
+                                        total_bytes += len(chunk)
+                        log(f'[+] SUCCESS! Streaming download complete: {video_path} ({total_bytes // 1024}KB)')
+                        download_success = True
+                        break
+                    except Exception as e:
+                        err_log(f'[-] Streaming requests download attempt {attempt+1} failed: {e}')
+                        if attempt < 2:
+                            await asyncio.sleep(3)  # Wait before retry
+
+            # ── METHOD 4: JS XMLHttpRequest fetch inside page (last resort, uses cookies) ──
+            if not download_success and not video_url.startswith('blob:'):
+                try:
+                    log('[+] Trying XHR download via browser JS (last resort)...')
+                    import base64 as _base64
+                    js_xhr = '''
+                    async (url) => {
+                        try {
+                            const resp = await fetch(url, {credentials: 'include'});
+                            if (!resp.ok) return null;
+                            const buf = await resp.arrayBuffer();
+                            const bytes = new Uint8Array(buf);
+                            let binary = '';
+                            const chunk = 32768;
+                            for (let i = 0; i < bytes.byteLength; i += chunk) {
+                                binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+                            }
+                            return btoa(binary);
+                        } catch(e) { return null; }
+                    }
+                    '''
+                    b64 = await page.evaluate(js_xhr, video_url)
+                    if b64:
+                        video_bytes = _base64.b64decode(b64)
+                        with open(video_path, 'wb') as f:
+                            f.write(video_bytes)
+                        log(f'[+] SUCCESS! XHR browser JS download to: {video_path}')
+                        download_success = True
+                    else:
+                        raise ValueError('XHR returned no data')
+                except Exception as e:
+                    err_log(f'[-] XHR JS download failed: {e}')
 
             if not download_success:
-                try:
-                    if not video_url.startswith('http'):
-                        raise ValueError(f'Invalid URL: {video_url}')
-                    r = requests.get(video_url, timeout=30)
-                    r.raise_for_status()
-                    with open(video_path, 'wb') as f:
-                        f.write(r.content)
-                    log(f'[+] SUCCESS! Downloaded via requests to: {video_path}')
-                    download_success = True
-                except Exception as e:
-                    err_log(f'[-] requests download error: {e}')
+                err_log(f'[-] ALL DOWNLOAD METHODS FAILED for: {video_url[:80]}')
         
             if caption:
                 txt_path = os.path.join(output_dir, filename_base + ".txt")
