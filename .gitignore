@@ -51,3 +51,29 @@ Thumbs.db
 !.github/
 !.github/workflows/
 !.github/workflows/*.yml
+
+# ── Large binary files (exceed GitHub 100MB limit) ──
+ffmpeg.exe
+ffmpeg
+*.exe
+*.dll
+*.so
+*.dylib
+
+# ── Bundled Tor files (included in installer, not in source repo) ──
+tor/
+
+# ── Image/media assets (large files) ──
+*.png
+*.jpg
+*.jpeg
+*.ico
+*.gif
+*.webp
+*.mp4
+*.webm
+*.avi
+*.mov
+
+# ── Error screenshots ──
+error_*.png

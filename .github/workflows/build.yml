@@ -7,12 +7,12 @@ name: Build & Release
 on:
   push:
     tags:
-      - 'v*'  # Trigger on version tags: v1.0.0, v1.1.0, etc.
+      - 'v*'  # Trigger on version tags: v1.3.0, v1.4.0, etc.
 
 jobs:
   build:
     runs-on: windows-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -26,12 +26,28 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install nuitka ordered-set zstandard
+          pip install pyinstaller
           playwright install chromium
 
-      - name: Secure Build (Nuitka -> C++ -> EXE)
+      - name: Build EXE (PyInstaller)
         run: |
-          python secure_build.py
+          pyinstaller `
+            --noconfirm `
+            --onedir `
+            --windowed `
+            --name "ZakariyaAutomator" `
+            --icon "app_icon.ico" `
+            --add-data "app_logo.png;." `
+            --add-data "app_icon.ico;." `
+            --add-data "ui/splash.png;ui" `
+            --add-data "VERSION;." `
+            --hidden-import "PyQt6.sip" `
+            --hidden-import "playwright.sync_api" `
+            bot_ui_pyqt6.py
+
+      - name: Copy ffmpeg into dist
+        run: |
+          Copy-Item "ffmpeg.exe" "dist/ZakariyaAutomator/ffmpeg.exe"
 
       - name: Get version from tag
         id: version
@@ -40,29 +56,33 @@ jobs:
 
       - name: Create ZIP archive
         run: |
-          Compress-Archive -Path secure_build/dist/DolaVideoGen/* -DestinationPath DolaVideoGen-${{ steps.version.outputs.VERSION }}.zip
+          Compress-Archive -Path dist/ZakariyaAutomator/* -DestinationPath ZakariyaAutomator-${{ steps.version.outputs.VERSION }}.zip
 
-      - name: Create Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ github.ref_name }}
           name: "Zakariya Automator ${{ github.ref_name }}"
           body: |
             ## Zakariya Automator ${{ github.ref_name }}
-            
-            ### What's New in v1.2.1 — Download Fix
-            - **Fixed: Video download getting stuck** — Bot ab 4 alag methods se download karta hai
-            - **Method 1**: Dola's built-in download button click (browser native)
-            - **Method 2**: Playwright browser session (CDN cookies ke saath) — timeout 30s → **5 minutes**
-            - **Method 3**: Streaming download with 3 auto-retries (1MB chunks, no memory overflow)
-            - **Method 4**: XHR browser JS fallback (credentials included)
-            - Video generate hone ke baad download guaranteed hoga
-            
+
+            ### v1.3.0 — Direct API Mode, Ratio Fix, Title Features
+            - **Fixed**: Ratio (9:16, 16:9) now correctly passed to Dola API
+            - **Fixed**: Timelapse bypass working for all ratios
+            - **Fixed**: Video completion check (status=3 only) — no more premature downloads
+            - **New**: Title On Video — ffmpeg burns `01. Title` on video bottom-center
+            - **New**: Title in Text File — random filename + matching .txt with title
+            - **Improved**: CSV Column B used as title source; falls back to prompt if no CSV
+            - **Removed**: Old browser-based generation (replaced by direct API)
+            - **Clean**: Project cleaned, unused files removed
+
             ### Installation
-            1. Download `DolaVideoGen-${{ github.ref_name }}.zip`
-            2. Extract and run `DolaVideoGen.exe`
+            1. Download `ZakariyaAutomator-${{ github.ref_name }}.zip`
+            2. Extract to any folder
+            3. Run `ZakariyaAutomator.exe`
+            4. Add your Dola cookies in Settings tab
 
           files: |
-            DolaVideoGen-${{ steps.version.outputs.VERSION }}.zip
+            ZakariyaAutomator-${{ steps.version.outputs.VERSION }}.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

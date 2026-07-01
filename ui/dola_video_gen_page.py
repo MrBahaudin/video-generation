@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QComboBox, QPushButton, QTextEdit, QProgressBar,
     QFileDialog, QMessageBox, QCheckBox, QFrame, QScrollArea, QSpinBox,
-    QApplication,
+    QApplication, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QTextCursor, QColor
@@ -28,9 +28,16 @@ from PyQt6.QtGui import QTextCursor, QColor
 # Add project root to path so we can import headless_bot and core
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from headless_bot import run_bot, internet_monitor
 from core.settings_manager import load_settings, save_settings, load_user_data, save_user_data
 from core.stats_tracker import StatsTracker
+
+# Import direct API client (no browser needed for sending)
+try:
+    import dola_direct as _dd
+    _DIRECT_AVAILABLE = True
+except Exception:
+    _DIRECT_AVAILABLE = False
+
 
 
 def _card(parent=None):
@@ -53,36 +60,141 @@ def _hline():
 
 
 class DolaBotWorker(QThread):
-    """Background worker thread for Dola browser-based batch generation."""
-    log_signal = pyqtSignal(str, str)      # message, level
+    """
+    Background worker — Direct API video generation (no browser window).
+    Uses dola_direct.py: urllib POST /chat/completion + Playwright headless
+    poll /im/chain/single for video URL + urllib download.
+    Same signal interface as before for full UI compatibility.
+    """
+    log_signal = pyqtSignal(str, str)           # message, level
     error_signal = pyqtSignal(str)
     progress_signal = pyqtSignal(int, int, int)  # completed, total, successes
-    stats_signal = pyqtSignal(int, int, int, int, int) # total, queued, active, ok, failed
+    stats_signal = pyqtSignal(int, int, int, int, int)  # total, queued, active, ok, failed
     finished_signal = pyqtSignal()
 
     def __init__(self, prompt_data, duration, total, concurrency, output_dir,
                  wait_timeout=600, start_delay=2, next_delay=5,
-                 headless=True, watermark_mode="Blur (Delogo)", proxy_list=None, mobile_mode=True, naming_mode="Title in CSV",
-                 process_start_timeout=60, ratio="9:16"):
+                 headless=True, watermark_mode="Blur (Delogo)", proxy_list=None,
+                 mobile_mode=True, naming_mode="Title in CSV",
+                 process_start_timeout=60, ratio="9:16", cookies_list=None):
         super().__init__()
-        self.prompt_data = prompt_data
-        self.duration = duration
-        self.total = total
-        self.concurrency = concurrency
-        self.output_dir = output_dir
-        self.wait_timeout = wait_timeout
-        self.current_timeout = wait_timeout
-        self.start_delay = start_delay
-        self.next_delay = next_delay
-        self.headless = headless
-        self.watermark_mode = watermark_mode
-        self.proxy_list = proxy_list or []
-        self.mobile_mode = mobile_mode
-        self.naming_mode = naming_mode
+        self.prompt_data       = prompt_data
+        self.duration          = duration
+        self.total             = total
+        self.concurrency       = concurrency
+        self.output_dir        = output_dir
+        self.wait_timeout      = wait_timeout
+        self.current_timeout   = wait_timeout
+        self.start_delay       = start_delay
+        self.next_delay        = next_delay
+        self.headless          = headless
+        self.watermark_mode    = watermark_mode
+        self.proxy_list        = proxy_list or []
+        self.mobile_mode       = mobile_mode
+        self.naming_mode       = naming_mode
         self.process_start_timeout = process_start_timeout
-        self.ratio = ratio
-        self._is_stopped = False
-        self._failed_prompts = []  # Track failed prompts for retry
+        self.ratio             = ratio
+        self._is_stopped       = False
+        self._failed_prompts   = []
+        # all_cookie_accounts: list of accounts (each account = list of cookie dicts)
+        # Round-robin: task N uses account N % len(accounts)
+        raw = cookies_list or []
+        # Support both "flat" (list of dicts = 1 account) and "nested" (list of lists)
+        if raw and isinstance(raw[0], dict):
+            self._all_accounts = [raw]   # wrap single account
+        else:
+            self._all_accounts = raw or [[]]
+        # Per-account rate limiting
+        self._credit_failures   = {}   # acct_idx -> consecutive "credit_exhausted" count
+        self._exhausted_accts   = set()  # permanently disabled this batch
+        self._success_count     = {}   # acct_idx -> successful video count this cycle
+        self._cooldown_until    = {}   # acct_idx -> datetime when cooldown ends
+        self.MAX_VIDEOS_PER_ACCT = 3   # videos per account before cooldown
+        self.COOLDOWN_HOURS      = 2   # hours to wait after limit reached
+
+    # ── Per-account video success tracking ─────────────────────────────────────
+    def _on_account_success(self, acct_idx: int):
+        """Call after a video is successfully downloaded. Starts cooldown after 3 videos."""
+        from datetime import datetime, timedelta
+        n = len(self._all_accounts)
+        self._success_count[acct_idx] = self._success_count.get(acct_idx, 0) + 1
+        count = self._success_count[acct_idx]
+        if count >= self.MAX_VIDEOS_PER_ACCT:
+            until = datetime.now() + timedelta(hours=self.COOLDOWN_HOURS)
+            self._cooldown_until[acct_idx] = until
+            self._success_count[acct_idx]  = 0   # reset for next cycle
+            self.log(
+                f"[⏰] Account {acct_idx+1}/{n} limit reached "
+                f"({self.MAX_VIDEOS_PER_ACCT} videos) — cooldown until "
+                f"{until.strftime('%H:%M')} ({self.COOLDOWN_HOURS}h)", "warn"
+            )
+
+    def _on_account_fail(self, acct_idx: int):
+        """Track credit-exhausted rejections. 2 consecutive = disable for this batch."""
+        n = len(self._all_accounts)
+        self._credit_failures[acct_idx] = self._credit_failures.get(acct_idx, 0) + 1
+        failures = self._credit_failures[acct_idx]
+        if failures >= 2:
+            self._exhausted_accts.add(acct_idx)
+            self.log(
+                f"[✖] Account {acct_idx+1}/{n} DISABLED "
+                f"(2 consecutive credit errors) — won't be used again this batch", "warn"
+            )
+        else:
+            self.log(
+                f"[!] Account {acct_idx+1}/{n} credit warning "
+                f"({failures}/2 before disable)", "warn"
+            )
+
+    def _pick_account(self, instance_id: int):
+        """
+        Round-robin account selection.
+        Skips: permanently exhausted accounts, accounts in cooldown.
+        Returns (acct_idx, cookies) or (None, None) if all unavailable.
+        """
+        from datetime import datetime
+        n = max(len(self._all_accounts), 1)
+        base_idx = (instance_id - 1) % n
+        now = datetime.now()
+
+        for offset in range(n):
+            candidate = (base_idx + offset) % n
+
+            # Skip permanently disabled
+            if candidate in self._exhausted_accts:
+                continue
+
+            # Check cooldown
+            if candidate in self._cooldown_until:
+                if now < self._cooldown_until[candidate]:
+                    remaining = int((self._cooldown_until[candidate] - now).total_seconds() / 60)
+                    # (don't log every pick — only log when all are cooling)
+                    continue
+                else:
+                    # Cooldown expired — re-enable
+                    del self._cooldown_until[candidate]
+                    n_accts = len(self._all_accounts)
+                    self.log(f"[✓] Account {candidate+1}/{n_accts} cooldown ended — re-enabled")
+
+            # This account is available
+            cookies = self._all_accounts[candidate] if self._all_accounts else None
+            return candidate, cookies
+
+        # All accounts unavailable — log why
+        n_accts = len(self._all_accounts)
+        in_cooldown = [i for i in range(n_accts) if i in self._cooldown_until and i not in self._exhausted_accts]
+        disabled    = list(self._exhausted_accts)
+        if in_cooldown:
+            soonest = min(self._cooldown_until[i] for i in in_cooldown)
+            remaining_min = max(1, int((soonest - now).total_seconds() / 60))
+            self.log(
+                f"[⏸] All {n_accts} accounts in cooldown. "
+                f"Next available in ~{remaining_min} min. Failing remaining tasks.", "warn"
+            )
+        elif disabled:
+            self.log(f"[✖] All accounts disabled (credit errors). Failing remaining tasks.", "warn")
+        return None, None
+
 
     def stop(self):
         self._is_stopped = True
@@ -102,132 +214,336 @@ class DolaBotWorker(QThread):
         print(f"[GUI Error] {message}")
         self.error_signal.emit(message)
 
+    async def _run_single(self, instance_id: int, prompt_text: str, caption=None) -> bool:
+        """
+        Generate one video via direct API. Returns True on success.
+        Round-robin: selects account by (instance_id - 1) % num_accounts.
+        Skips exhausted (credit-depleted) accounts automatically.
+        """
+        import re as _re
+        import shutil
+
+        # ── Round-robin cookie selection (skip exhausted accounts) ─────────
+        acct_idx, cookies = self._pick_account(instance_id)
+        if acct_idx is None:
+            self.log_error(f"[{instance_id}] All accounts exhausted — skipping task")
+            return False
+
+        n_accts = len(self._all_accounts)
+        self.log(f"[{instance_id}] POST /chat/completion — '{prompt_text[:40]}'")
+        if n_accts > 1:
+            self.log(f"[{instance_id}] Using account {acct_idx + 1}/{n_accts}")
+
+        # ── Step 1: Send request (no browser) ─────────────────────────────
+        reject_out = [None]
+        conv_id = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _dd.send_video_request(
+                prompt_text, self.duration,
+                log=lambda m: self.log(f"[{instance_id}] {m}"),
+                cookies=cookies,
+                _reject_out=reject_out,
+                ratio=self.ratio,
+            )
+        )
+        if not conv_id:
+            # Track credit exhaustion
+            if reject_out[0] == "credit_exhausted":
+                self._on_account_fail(acct_idx)
+            self.log_error(f"[{instance_id}] Failed to get conv_id (reason: {reject_out[0]})")
+            return False
+
+        if self._is_stopped:
+            return False
+
+        # ── Step 2: Poll for video URL via Playwright headless ─────────────
+        self.log(f"[{instance_id}] Polling conv {conv_id} for video...")
+        video_url = await _dd.poll_for_video(
+            conv_id,
+            timeout=self.current_timeout,
+            log=lambda m: self.log(f"[{instance_id}] {m}"),
+            cookies=cookies,
+        )
+        if not video_url:
+            self.log_error(f"[{instance_id}] Video URL not found (timeout)")
+            self._failed_prompts.append({"prompt": prompt_text})
+            return False
+
+        if self._is_stopped:
+            return False
+
+        # ── Step 3: Download ───────────────────────────────────────────────
+        # Determine output filename based on naming mode
+        import uuid as _uuid
+        if self.naming_mode == "Title in Text File":
+            # Random 8-char hex name — matching .txt created after save
+            rand_id = _uuid.uuid4().hex[:8]
+            filename = f"{rand_id}.mp4"
+        elif self.naming_mode == "Title On Video":
+            # Use CSV Column B if available, otherwise use prompt text as title
+            title_src = caption.strip() if caption else prompt_text[:50].strip()
+            cap_clean = _re.sub(r'[<>:"/\\|?*]', '', title_src)
+            filename = f"{instance_id:02d}. {cap_clean}.mp4"
+
+        tmp_path = _dd.download_video(
+            video_url, prompt_text, instance_id,
+            log=lambda m: self.log(f"[{instance_id}] {m}")
+        )
+        if not tmp_path:
+            self.log_error(f"[{instance_id}] Download failed")
+            return False
+
+        # ── Step 4: Watermark Removal (ffmpeg) ────────────────────────────
+        if self.watermark_mode in ["Blur (Delogo)", "Crop"]:
+            tmp_path = await self._remove_watermark(tmp_path, instance_id)
+
+        # Move to output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
+        dest = os.path.join(self.output_dir, filename)
+        try:
+            shutil.move(tmp_path, dest)
+            self.log(f"[{instance_id}] ✅ Saved: {dest}")
+        except Exception as e:
+            self.log(f"[{instance_id}] Move failed ({e}), file at: {tmp_path}")
+            return True
+
+        # ── Step 5: Post-processing based on naming mode ───────────────────
+        if self.naming_mode == "Title On Video":
+            title_src = caption.strip() if caption else prompt_text[:50].strip()
+            await self._burn_title(dest, instance_id, title_src)
+
+        elif self.naming_mode == "Title in Text File" and caption:
+            txt_path = os.path.splitext(dest)[0] + ".txt"
+            try:
+                with open(txt_path, 'w', encoding='utf-8') as _f:
+                    _f.write(caption)
+                self.log(f"[{instance_id}] ✅ Text file: {txt_path}")
+            except Exception as e:
+                self.log_error(f"[{instance_id}] TXT write failed: {e}")
+
+        return True
+
+    async def _remove_watermark(self, video_path: str, instance_id: int) -> str:
+        """
+        Remove Dola watermark/logo from downloaded video using ffmpeg.
+        Returns path to processed video (replaces original in-place).
+        """
+        import subprocess as _sp, sys as _sys, re as _re
+
+        self.log(f"[{instance_id}] Removing watermark ({self.watermark_mode})...")
+
+        # Locate ffmpeg.exe
+        if getattr(_sys, 'frozen', False):
+            app_dir = os.path.dirname(_sys.executable)
+        else:
+            app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        ffmpeg_exe = os.path.join(app_dir, "ffmpeg.exe")
+        if not os.path.exists(ffmpeg_exe):
+            meipass = getattr(_sys, '_MEIPASS', None)
+            if meipass:
+                ffmpeg_exe = os.path.join(meipass, "ffmpeg.exe")
+            if not meipass or not os.path.exists(ffmpeg_exe):
+                ffmpeg_exe = "ffmpeg"  # system PATH fallback
+
+        # Probe video dimensions
+        v_width, v_height = 720, 1280
+        try:
+            probe = _sp.run(
+                [ffmpeg_exe, "-i", video_path],
+                stdout=_sp.PIPE, stderr=_sp.PIPE, text=True
+            )
+            m = _re.search(r'Video:.*?\s(\d{3,5})x(\d{3,5})', probe.stderr)
+            if m:
+                v_width, v_height = int(m.group(1)), int(m.group(2))
+        except Exception:
+            pass
+
+        # Build filter
+        if self.watermark_mode == "Blur (Delogo)":
+            w, h = 170, 50
+            x = max(0, v_width - w - 10)
+            y = max(0, v_height - h - 10)
+            filter_cmd = f"delogo=x={x}:y={y}:w={w}:h={h}"
+        else:  # Crop
+            filter_cmd = "crop=iw:ih-80:0:0"
+
+        temp_path = video_path + ".wm_temp.mp4"
+        cmd = [
+            ffmpeg_exe, "-y", "-i", video_path,
+            "-vf", filter_cmd,
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+            "-c:a", "copy", temp_path
+        ]
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await process.communicate()
+            if process.returncode == 0 and os.path.exists(temp_path):
+                os.remove(video_path)
+                os.rename(temp_path, video_path)
+                self.log(f"[{instance_id}] ✅ Watermark removed!")
+            else:
+                err = stderr.decode("utf-8", errors="ignore")[-200:]
+                self.log_error(f"[{instance_id}] ffmpeg error: {err}")
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+        except FileNotFoundError:
+            self.log_error(f"[{instance_id}] ffmpeg not found! Logo NOT removed.")
+        except Exception as e:
+            self.log_error(f"[{instance_id}] Watermark removal failed: {e}")
+
+        return video_path  # Return original path (modified in-place)
+
+    async def _burn_title(self, video_path: str, instance_id: int, caption: str):
+        """
+        Burn numbered title onto video using ffmpeg drawtext.
+        Text: '{instance_id}. {caption}' — bottom-center, white + black border.
+        """
+        import subprocess as _sp, sys as _sys
+
+        self.log(f"[{instance_id}] Burning title on video...")
+
+        # Locate ffmpeg
+        if getattr(_sys, 'frozen', False):
+            app_dir = os.path.dirname(_sys.executable)
+        else:
+            app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        ffmpeg_exe = os.path.join(app_dir, "ffmpeg.exe")
+        if not os.path.exists(ffmpeg_exe):
+            meipass = getattr(_sys, '_MEIPASS', None)
+            if meipass:
+                ffmpeg_exe = os.path.join(meipass, "ffmpeg.exe")
+            if not meipass or not os.path.exists(ffmpeg_exe):
+                ffmpeg_exe = "ffmpeg"
+
+        # Numbered title text — escape ffmpeg special chars
+        title_text = f"{instance_id:02d}. {caption.strip()}"
+        escaped = (
+            title_text
+            .replace("\\", "\\\\")
+            .replace("'", "\\'")
+            .replace(":", "\\:")
+            .replace("%", "\\%")
+        )
+
+        # Font: try Arial, fallback to built-in
+        arial = r"C:\Windows\Fonts\arial.ttf"
+        if os.path.exists(arial):
+            font_part = "fontfile='C\\\\:/Windows/Fonts/arial.ttf':"
+        else:
+            font_part = ""
+
+        drawtext = (
+            f"drawtext={font_part}"
+            f"text='{escaped}':"
+            f"fontsize=40:"
+            f"fontcolor=white:"
+            f"borderw=3:"
+            f"bordercolor=black:"
+            f"x=(w-text_w)/2:"
+            f"y=h-th-50"
+        )
+
+        temp_path = video_path + ".title_tmp.mp4"
+        cmd = [
+            ffmpeg_exe, "-y", "-i", video_path,
+            "-vf", drawtext,
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",
+            "-c:a", "copy", temp_path
+        ]
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await process.communicate()
+            if process.returncode == 0 and os.path.exists(temp_path):
+                os.remove(video_path)
+                os.rename(temp_path, video_path)
+                self.log(f"[{instance_id}] ✅ Title burned!")
+            else:
+                err = stderr.decode('utf-8', errors='ignore')[-300:]
+                self.log_error(f"[{instance_id}] Title burn failed: {err}")
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+        except FileNotFoundError:
+            self.log_error(f"[{instance_id}] ffmpeg not found — title NOT burned.")
+        except Exception as e:
+            self.log_error(f"[{instance_id}] Title burn error: {e}")
+
     async def batch_manager(self):
-        sem = asyncio.Semaphore(self.concurrency)
-        ffmpeg_sem = asyncio.Semaphore(2)
+
+        sem       = asyncio.Semaphore(self.concurrency)
         completed = 0
         successes = 0
-        active = 0
+        active    = 0
 
-        internet_task = asyncio.create_task(internet_monitor())
+        self.log("🚀 Direct API mode — no browser window needed")
+        self.log(f"   Duration: {self.duration}s  |  Concurrency: {self.concurrency}")
 
-        from playwright.async_api import async_playwright
-        
-        async with async_playwright() as p:
-            self.log("Launching browser...")
-            try:
-                browser = await p.chromium.launch(
-                    headless=self.headless,
-                    args=["--disable-blink-features=AutomationControlled"]
-                )
-            except Exception as e:
-                self.log_error(f"[-] Failed to launch browser: {e}")
-                return
+        async def worker(instance_id):
+            nonlocal completed, successes, active
+            async with sem:
+                if self._is_stopped:
+                    return
 
-            async def worker(instance_id):
-                nonlocal completed, successes, active
-                async with sem:
+                # Pre-delay
+                for _ in range(self.next_delay):
                     if self._is_stopped:
                         return
-                        
-                    is_generating = False
-                    def on_generating():
-                        nonlocal active, is_generating
-                        if not is_generating:
-                            is_generating = True
-                            active += 1
-                            failed_cnt = completed - successes
-                            queued_cnt = self.total - completed - active
-                            self.stats_signal.emit(self.total, queued_cnt, active, successes, failed_cnt)
+                    await asyncio.sleep(1)
 
-                    failed = completed - successes
-                    queued = self.total - completed - active
-                    self.stats_signal.emit(self.total, queued, active, successes, failed)
+                # Mark active
+                active += 1
+                failed_cnt = completed - successes
+                queued_cnt = self.total - completed - active
+                self.stats_signal.emit(self.total, queued_cnt, active, successes, failed_cnt)
 
-                    if self.next_delay > 0:
-                        # Waiting before next task (silent)
-                        for _ in range(self.next_delay):
-                            if self._is_stopped:
-                                if is_generating:
-                                    active -= 1
-                                self.stats_signal.emit(self.total, queued, active, successes, failed)
-                                return
-                            await asyncio.sleep(1)
+                data        = self.prompt_data[(instance_id - 1) % len(self.prompt_data)]
+                prompt_text = data.get("prompt", "")
+                caption     = data.get("caption", None)
 
-                    data = self.prompt_data[(instance_id - 1) % len(self.prompt_data)]
-                    prompt_text = data.get("prompt", "")
-                    caption = data.get("caption", None)
+                self.log(f"[{instance_id}] ▶ '{prompt_text[:50]}'")
 
-                    # Assign proxy via round-robin if proxy list is available
-                    proxy = None
-                    if self.proxy_list:
-                        proxy = self.proxy_list[(instance_id - 1) % len(self.proxy_list)]
-                        self.log(f"[Bot {instance_id}] Using proxy: {proxy}")
+                success = False
+                try:
+                    success = await self._run_single(instance_id, prompt_text, caption)
+                except Exception as e:
+                    self.log_error(f"[{instance_id}] Unexpected error: {e}")
 
-                    self.log(f"[Bot {instance_id}] Starting with prompt: '{prompt_text[:30]}...'")
-                    try:
-                        success = await run_bot(
-                            browser=browser,
-                            prompt_text=prompt_text,
-                            duration=self.duration,
-                            ratio=self.ratio,
-                            instance_id=instance_id,
-                            watermark_mode=self.watermark_mode,
-                            log_callback=self.log,
-                            error_callback=self.log_error,
-                            output_dir=self.output_dir,
-                            caption=caption,
-                            wait_timeout=self.current_timeout,
-                            ffmpeg_sem=ffmpeg_sem,
-                            stop_check=lambda: self._is_stopped,
-                            proxy=proxy,
-                            mobile_mode=self.mobile_mode,
-                            naming_mode=self.naming_mode,
-                            on_generating_callback=on_generating,
-                            process_start_timeout=self.process_start_timeout
-                        )
-                        
-                        if success:
-                            successes += 1
-                        else:
-                            # Track failed prompt for retry
-                            self._failed_prompts.append(data)
-                    except Exception as e:
-                        self.log_error(f"[-] [Bot {instance_id}] Error in worker: {str(e)}")
-                        success = False
-                        
-                    if is_generating:
-                        active -= 1
+                active -= 1
+                completed += 1
+                if success:
+                    successes += 1
+                else:
+                    self._failed_prompts.append(data)
 
-                    completed += 1
-                    failed = completed - successes
-                    queued = self.total - completed - active
-                    
-                    self.progress_signal.emit(completed, self.total, successes)
-                    self.stats_signal.emit(self.total, queued, active, successes, failed)
+                failed = completed - successes
+                queued = self.total - completed - active
+                self.progress_signal.emit(completed, self.total, successes)
+                self.stats_signal.emit(self.total, queued, active, successes, failed)
 
-            tasks = []
-            for i in range(1, self.total + 1):
+        tasks = []
+        for i in range(1, self.total + 1):
+            if self._is_stopped:
+                break
+            tasks.append(asyncio.create_task(worker(i)))
+            # Stagger starts
+            for _ in range(self.start_delay):
                 if self._is_stopped:
                     break
-                tasks.append(asyncio.create_task(worker(i)))
-                if self.start_delay > 0:
-                    for _ in range(self.start_delay):
-                        if self._is_stopped:
-                            break
-                        await asyncio.sleep(1)
+                await asyncio.sleep(1)
 
-            try:
-                if tasks:
-                    await asyncio.gather(*tasks)
-            finally:
-                # Always cleanup browser — even on crash or forced stop
-                if browser:
-                    try:
-                        await browser.close()
-                    except Exception:
-                        pass
-                internet_task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks)
+
+        self.log(f"✅ Batch done: {successes}/{self.total} succeeded")
 
 
 class DolaVideoGenPage(QWidget):
@@ -274,6 +590,8 @@ class DolaVideoGenPage(QWidget):
         # Config Card
         root.addWidget(self._build_config_card())
 
+        # Flood Mode Card
+
         # Stats Card
         root.addWidget(self._build_stats_card())
 
@@ -308,7 +626,7 @@ class DolaVideoGenPage(QWidget):
         naming_row = QHBoxLayout()
         naming_row.addWidget(QLabel("File Naming:"))
         self._naming_combo = QComboBox()
-        self._naming_combo.addItems(["Title in CSV", "Title On Video"])
+        self._naming_combo.addItems(["Title On Video", "Title in Text File"])
         naming_row.addWidget(self._naming_combo)
         naming_row.addStretch()
         lay.addLayout(naming_row)
@@ -431,14 +749,16 @@ class DolaVideoGenPage(QWidget):
         grid.addWidget(self._watermark_combo, 3, 2)
 
         self._ratio_combo = QComboBox()
-        self._ratio_combo.addItems(["9:16", "16:9", "1:1", "4:3", "3:4", "21:9"])
+        self._ratio_combo.addItems(["9:16", "16:9"])
+        self._ratio_combo.setCurrentText("9:16")
         self._ratio_combo.setToolTip(
             "Video aspect ratio:\n"
+            "1:1  — Square (Instagram post)\n"
+            "3:4  — Portrait\n"
+            "4:3  — Classic landscape\n"
             "9:16 — Vertical (TikTok, Reels, Shorts)\n"
             "16:9 — Horizontal (YouTube, landscape)\n"
-            "1:1  — Square (Instagram post)\n"
-            "4:3  — Classic landscape\n"
-            "3:4  — Portrait"
+            "21:9 — Ultrawide cinematic"
         )
         grid.addWidget(self._ratio_combo, 3, 3)
 
@@ -536,40 +856,30 @@ class DolaVideoGenPage(QWidget):
 
         lay.addWidget(_hline())
 
-        # ── Proxy List ──
-        proxy_hdr = QHBoxLayout()
-        proxy_hdr.addWidget(_label("🌐  PROXY LIST (IP Rotation)", "section_title"))
-        proxy_hdr.addStretch()
-        self._proxy_count_lbl = QLabel("0 proxies")
-        self._proxy_count_lbl.setStyleSheet("color:#60a5fa; font-size:11px; font-weight:700;")
-        proxy_hdr.addWidget(self._proxy_count_lbl)
-        lay.addLayout(proxy_hdr)
-
-        self._proxy_entry = QTextEdit()
-        self._proxy_entry.setPlaceholderText(
-            'Paste proxies here (1 per line)...\n\n'
-            'Formats supported:\n'
-            '  host:port\n'
-            '  user:pass@host:port\n'
-            '  socks5://host:port\n'
-            '  http://host:port\n\n'
-            'Leave empty = no proxy (direct IP)'
+        # ── Settings Redirect Banner ──
+        redirect_frame = QFrame()
+        redirect_frame.setStyleSheet(
+            "QFrame { background: rgba(96,165,250,0.07); "
+            "border: 1px solid rgba(96,165,250,0.18); border-radius: 8px; }"
         )
-        self._proxy_entry.setMinimumHeight(60)
-        self._proxy_entry.setMaximumHeight(100)
-        self._proxy_entry.textChanged.connect(self._update_proxy_count)
-        lay.addWidget(self._proxy_entry)
-
-        proxy_file_row = QHBoxLayout()
-        proxy_load_btn = QPushButton("📂 Load Proxy File")
-        proxy_load_btn.setMinimumWidth(130)
-        proxy_load_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        proxy_load_btn.clicked.connect(self._load_proxy_file)
-        proxy_file_row.addWidget(proxy_load_btn)
-        proxy_file_row.addStretch()
-        lay.addLayout(proxy_file_row)
+        rd_lay = QHBoxLayout(redirect_frame)
+        rd_lay.setContentsMargins(14, 10, 14, 10)
+        rd_icon = QLabel("⚙️")
+        rd_icon.setStyleSheet("font-size:18px; background:transparent; border:none;")
+        rd_lay.addWidget(rd_icon)
+        rd_text = QLabel(
+            "<b style='color:#60a5fa'>Cookies &amp; Proxy settings</b> "
+            "<span style='color:#64748b'>have been moved to the "
+            "<b style='color:#f59e0b'>⚙️ Settings</b> page in the sidebar. "
+            "Add cookie accounts there for Flood Mode &amp; batch rotation.</span>"
+        )
+        rd_text.setWordWrap(True)
+        rd_text.setStyleSheet("background:transparent; border:none; font-size:11px;")
+        rd_lay.addWidget(rd_text, 1)
+        lay.addWidget(redirect_frame)
 
         return card
+
 
     def _build_stats_card(self):
         card = _card()
@@ -761,11 +1071,11 @@ class DolaVideoGenPage(QWidget):
         s = load_settings()
         ud = load_user_data()
         self._folder_entry.setText("")  # Do not load saved location
-        self._conc_entry.setText(s.get("concurrency", "20"))
+        self._conc_entry.setText(s.get("concurrency", "10"))
         self._dur_combo.setCurrentText(s.get("duration", "15s"))
         self._ratio_combo.setCurrentText(s.get("ratio", "9:16"))
         self._timeout_entry.setText(s.get("timeout_min", "30"))
-        self._process_start_entry.setText(s.get("process_start_timeout", "80"))
+        self._process_start_entry.setText(s.get("process_start_timeout", "60"))
         self._delay_entry.setText(s.get("start_delay", "5"))
         self._next_delay_entry.setText(s.get("next_delay", "5"))
         self._headless_cb.setChecked(s.get("show_browser", True))
@@ -774,8 +1084,8 @@ class DolaVideoGenPage(QWidget):
         self._mobile_cb.setChecked(False)
 
         # Load large data from user_data
-        self._proxy_entry.setText(ud.get("proxy_list", ""))
         self._prompt_entry.setText("")  # Do not load saved prompt
+        # (Cookies and Proxies are managed by SettingsPage)
 
     def _save_settings(self):
         # Save small UI settings
@@ -791,12 +1101,8 @@ class DolaVideoGenPage(QWidget):
         s["watermark_mode"] = self._watermark_combo.currentText()
         s["auto_loop"] = self._loop_cb.isChecked()
         s["mobile_mode"] = self._mobile_cb.isChecked()
+        # Proxy and Cookies are now managed by SettingsPage — not saved here
         save_settings(s)
-
-        # Save large data separately
-        ud = load_user_data()
-        ud["proxy_list"] = self._proxy_entry.toPlainText().strip()
-        save_user_data(ud)
 
     # ─── Actions ───────────────────────────────────────
 
@@ -805,6 +1111,49 @@ class DolaVideoGenPage(QWidget):
         if folder:
             self._folder_entry.setText(folder)
             self._save_settings()
+
+    def _browse_tor_exe(self):
+        """Open file dialog to locate tor.exe."""
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Select tor.exe", "", "Tor Executable (tor.exe);;All Files (*)"
+        )
+        if filepath:
+            self._tor_exe_entry.setText(filepath)
+            self._save_settings()
+
+    def _on_tor_toggle(self, state):
+        """Enable/disable Tor controls based on checkbox state."""
+        enabled = bool(state)
+        self._set_tor_controls_enabled(enabled)
+        if enabled:
+            # Auto-fill bundled tor.exe path if current entry is empty/invalid/default
+            from core.tor_manager import TorManager as _TorMgr
+            import os as _os
+            current = self._tor_exe_entry.text().strip()
+            if not current or not _os.path.isfile(current):
+                resolved = _TorMgr.resolve_tor_exe("tor.exe")
+                self._tor_exe_entry.setText(resolved)
+                if _os.path.isfile(resolved):
+                    self._log(f"[+] Tor: bundled tor.exe found → {resolved}", "success")
+                else:
+                    self._log(
+                        "[!] Tor: bundled tor.exe not found. "
+                        "Please set path to tor.exe manually.", "warn"
+                    )
+            # Warn if proxy list is non-empty
+            if self._proxy_entry.toPlainText().strip():
+                self._log(
+                    "[i] Tor mode enabled — manual proxy list will be IGNORED while Tor is active.",
+                    "warn"
+                )
+        self._save_settings()
+
+    def _set_tor_controls_enabled(self, enabled: bool):
+        """Enable or disable Tor-specific controls."""
+        # Path field: editable when enabled (so advanced users can override)
+        self._tor_exe_entry.setEnabled(enabled)
+        self._tor_exe_entry.setReadOnly(False)  # Always editable when visible
+        self._tor_base_port_entry.setEnabled(enabled)
 
     def _open_folder(self):
         path = self._folder_entry.text().strip()
@@ -1253,9 +1602,11 @@ class DolaVideoGenPage(QWidget):
         self._ok_lbl.setText("0")
         self._fail_lbl.setText("0")
 
-        # Parse proxy list
-        proxy_text = self._proxy_entry.toPlainText().strip()
-        proxy_list = [p.strip() for p in proxy_text.splitlines() if p.strip()] if proxy_text else []
+        # Parse proxy list from Settings page if available
+        if hasattr(self, '_settings_page_ref') and self._settings_page_ref:
+            proxy_list = self._settings_page_ref.get_proxy_list()
+        else:
+            proxy_list = []
         mobile_mode = self._mobile_cb.isChecked()
 
         prompt_data = self._parse_prompts(text)
@@ -1279,10 +1630,11 @@ class DolaVideoGenPage(QWidget):
             self._log("[-] Error: No valid prompts found.", "error")
             return
 
-        duration = self._dur_combo.currentText()
+        duration_str = self._dur_combo.currentText()   # e.g. "15s"
+        duration_int = int(duration_str.replace("s", "").strip())
         ratio = self._ratio_combo.currentText()
         out_dir = self._folder_entry.text()
-        is_headless = False  # Browser always visible (Hide Browser checkbox removed)
+        is_headless = False
         watermark_mode = self._watermark_combo.currentText()
         naming_mode = self._naming_combo.currentText()
 
@@ -1303,11 +1655,27 @@ class DolaVideoGenPage(QWidget):
 
         self._progress_bar.setValue(0)
 
+        # Get ALL cookie accounts for round-robin rotation
+        cookies_list = []
+        if hasattr(self, '_settings_page_ref') and self._settings_page_ref:
+            accounts = self._settings_page_ref.get_cookie_accounts()
+            if accounts:
+                cookies_list = accounts  # Pass ALL accounts for round-robin
+                self._log(
+                    f"[+] Using {len(accounts)} cookie account(s) from Settings "
+                    f"(round-robin per task)", "info"
+                )
+            else:
+                self._log("[!] No cookie accounts in Settings — using built-in cookies", "warn")
+        else:
+            self._log("[!] Settings page not linked — using built-in cookies", "warn")
+
         self._worker = DolaBotWorker(
-            prompt_data, duration, total, concurrency, out_dir,
+            prompt_data, duration_int, total, concurrency, out_dir,
             wait_timeout, start_delay, next_delay, is_headless, watermark_mode,
             proxy_list=proxy_list, mobile_mode=mobile_mode, naming_mode=naming_mode,
-            process_start_timeout=process_start_timeout, ratio=ratio
+            process_start_timeout=process_start_timeout, ratio=ratio,
+            cookies_list=cookies_list,
         )
         self._worker.log_signal.connect(lambda msg, lvl: self._log(msg, lvl))
         self._worker.error_signal.connect(self._log_error)
@@ -1318,3 +1686,4 @@ class DolaVideoGenPage(QWidget):
 
         # Start stats tracking session
         self._stats_tracker.start_session(total_prompts=total)
+
