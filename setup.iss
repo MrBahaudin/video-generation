@@ -1,8 +1,9 @@
-; Zakariya Automator — Inno Setup Script v1.3.0
+; Zakariya Automator — Inno Setup Script v1.4.0
 ; Creates a proper Windows installer (.exe)
+; Includes: App + ffmpeg + Playwright Chromium (no internet needed)
 
 #define MyAppName "Zakariya Automator"
-#define MyAppVersion "1.3.0"
+#define MyAppVersion "1.4.0"
 #define MyAppPublisher "MrBahaudin"
 #define MyAppExeName "ZakariyaAutomator.exe"
 #define MyAppDir "dist\ZakariyaAutomator"
@@ -21,18 +22,24 @@ Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
+; Minimum Windows 10
+MinVersion=10.0
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
-; Main app files
+; Main app files (EXE + all DLLs + Python libs)
 Source: "{#MyAppDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-; ffmpeg
+
+; ffmpeg (watermark removal)
 Source: "ffmpeg.exe"; DestDir: "{app}"; Flags: ignoreversion
+
+; Playwright Chromium browser (bundled — works offline on any PC)
+Source: "{#MyAppDir}\playwright_browsers\*"; DestDir: "{app}\playwright_browsers"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
