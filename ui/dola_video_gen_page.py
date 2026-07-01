@@ -250,7 +250,23 @@ class DolaBotWorker(QThread):
             # Track credit exhaustion
             if reject_out[0] == "credit_exhausted":
                 self._on_account_fail(acct_idx)
-            self.log_error(f"[{instance_id}] Failed to get conv_id (reason: {reject_out[0]})")
+                self.log_error(f"[{instance_id}] ❌ Account credit exhausted — please add fresh cookies in Settings")
+            elif reject_out[0] == "content_policy":
+                self.log_error(f"[{instance_id}] ❌ Content policy rejection — try a different prompt")
+            elif reject_out[0] == "duration":
+                self.log_error(f"[{instance_id}] ❌ Duration rejected by Dola — prompt may mention time")
+            elif reject_out[0] == "cookies_invalid":
+                self.log_error(
+                    f"[{instance_id}] ❌ Cookies invalid/expired! "
+                    f"Please go to Settings and update your Dola.com cookies."
+                )
+            else:
+                # reason=None means cookies are invalid/expired or network error
+                self.log_error(
+                    f"[{instance_id}] ❌ Failed to get conv_id — "
+                    f"Cookies are invalid or expired! "
+                    f"Please update cookies in Settings tab and try again."
+                )
             return False
 
         if self._is_stopped:

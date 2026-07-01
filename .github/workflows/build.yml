@@ -49,6 +49,22 @@ jobs:
         run: |
           Copy-Item "ffmpeg.exe" "dist/ZakariyaAutomator/ffmpeg.exe"
 
+      - name: Copy Playwright Chromium into dist
+        run: |
+          # Find where playwright installed chromium (Windows default)
+          $playwrightBrowsers = "$env:USERPROFILE\AppData\Local\ms-playwright"
+          if (Test-Path $playwrightBrowsers) {
+            $destPath = "dist/ZakariyaAutomator/playwright_browsers"
+            Write-Host "Copying Playwright browsers from $playwrightBrowsers to $destPath"
+            Copy-Item -Recurse -Force $playwrightBrowsers $destPath
+            Write-Host "Playwright browsers copied successfully!"
+            # Show what was copied
+            Get-ChildItem $destPath | Select-Object Name
+          } else {
+            Write-Error "Playwright browsers not found at $playwrightBrowsers"
+            exit 1
+          }
+
       - name: Get version from tag
         id: version
         run: |
@@ -66,15 +82,17 @@ jobs:
           body: |
             ## Zakariya Automator ${{ github.ref_name }}
 
-            ### v1.3.0 — Direct API Mode, Ratio Fix, Title Features
+            ### Latest Fixes
+            - **Fixed**: Playwright Chromium now bundled in ZIP — videos work on ANY PC ✅
+            - **Fixed**: Download folder is now dynamic (created next to .exe on any PC) ✅
+            - **Fixed**: Clear error messages for expired/invalid cookies ✅
+            - **Fixed**: cookies_invalid detection — no more silent failures ✅
+
+            ### Previous Changes (v1.3.0)
             - **Fixed**: Ratio (9:16, 16:9) now correctly passed to Dola API
-            - **Fixed**: Timelapse bypass working for all ratios
-            - **Fixed**: Video completion check (status=3 only) — no more premature downloads
-            - **New**: Title On Video — ffmpeg burns `01. Title` on video bottom-center
-            - **New**: Title in Text File — random filename + matching .txt with title
-            - **Improved**: CSV Column B used as title source; falls back to prompt if no CSV
-            - **Removed**: Old browser-based generation (replaced by direct API)
-            - **Clean**: Project cleaned, unused files removed
+            - **Fixed**: Video completion check (status=3 only)
+            - **New**: Title On Video, Title in Text File naming modes
+            - **New**: Direct API mode (no browser window needed)
 
             ### Installation
             1. Download `ZakariyaAutomator-${{ github.ref_name }}.zip`

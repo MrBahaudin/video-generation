@@ -59,6 +59,12 @@ ffmpeg
 *.dll
 *.so
 *.dylib
+*.rar
+
+# ── Installer output (never push — upload via GitHub Release instead) ──
+installer_output/
+ZakariyaAutomator-*.zip
+innosetup_installer.exe
 
 # ── Bundled Tor files (included in installer, not in source repo) ──
 tor/
